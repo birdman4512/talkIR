@@ -188,6 +188,19 @@ input[type=range]:disabled { opacity: 0.4; }
   font-size: 13px;
 }
 
+/* Context message — standalone chat element above the response */
+.msg.context-msg {
+  justify-content: flex-start;
+  padding-left: 4px;
+}
+.context-block {
+  border-color: var(--surface2);
+}
+.context-block > summary {
+  color: var(--accent2);
+}
+.context-block > summary:hover { color: var(--text); }
+
 /* DeepSeek reasoning block */
 .think-block {
   max-width: 78%;
