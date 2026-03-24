@@ -188,6 +188,49 @@ input[type=range]:disabled { opacity: 0.4; }
   font-size: 13px;
 }
 
+/* Model catalogue */
+.catalogue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.catalogue-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 4px;
+  border-radius: var(--radius);
+  font-size: 12px;
+}
+.catalogue-row:hover { background: var(--surface2); }
+.catalogue-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.catalogue-name { color: var(--text); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.catalogue-desc { font-size: 10px; }
+.catalogue-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.catalogue-size  { font-size: 10px; }
+.catalogue-badge.installed { color: var(--accent2); font-size: 13px; }
+.btn-pull {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 1px 7px;
+  line-height: 1.4;
+}
+.btn-pull:hover { background: var(--border); }
+.pull-progress {
+  font-size: 11px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  min-width: 36px;
+  text-align: right;
+}
+
 /* Context message — standalone chat element above the response */
 .msg.context-msg {
   justify-content: flex-start;

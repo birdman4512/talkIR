@@ -18,9 +18,11 @@ const maxResultsVal   = document.getElementById('maxResultsVal');
 const allResultsCb    = document.getElementById('allResults');
 const refreshBtn      = document.getElementById('refreshIndices');
 const clearBtn        = document.getElementById('clearChat');
-const modelBadge      = document.getElementById('modelBadge');
-const providerSelect  = document.getElementById('providerSelect');
-const modelSelect     = document.getElementById('modelSelect');
+const modelBadge       = document.getElementById('modelBadge');
+const providerSelect   = document.getElementById('providerSelect');
+const modelSelect      = document.getElementById('modelSelect');
+const catalogueList    = document.getElementById('catalogueList');
+const refreshCatalogue = document.getElementById('refreshCatalogue');
 const chatStatusEl    = document.getElementById('chatStatus');
 const chatStatusIcon  = document.getElementById('chatStatusIcon');
 const chatStatusText  = document.getElementById('chatStatusText');
@@ -30,7 +32,9 @@ const chatStatusTimer = document.getElementById('chatStatusTimer');
 loadIndices();
 loadModelInfo();
 loadModels();
+loadCatalogue();
 providerSelect.addEventListener('change', onProviderChange);
+refreshCatalogue.addEventListener('click', loadCatalogue);
 
 maxResultsInput.addEventListener('input', () => {
   maxResultsVal.textContent = maxResultsInput.value;
@@ -167,6 +171,85 @@ function updateBadge() {
 
 function getSelectedModel()    { return modelSelect.value || ''; }
 function getSelectedProvider() { return providerSelect.value || 'ollama'; }
+
+// ─── Model catalogue ──────────────────────────────────────────────────────────
+async function loadCatalogue() {
+  catalogueList.innerHTML = '<span class="muted">Loading…</span>';
+  try {
+    const resp = await fetch('/api/models/catalogue');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const models = await resp.json();
+    catalogueList.innerHTML = models.map(m => `
+      <div class="catalogue-row" data-model="${esc(m.name)}">
+        <div class="catalogue-info">
+          <span class="catalogue-name">${esc(m.name)}</span>
+          <span class="catalogue-desc muted">${esc(m.desc)}</span>
+        </div>
+        <div class="catalogue-right">
+          <span class="catalogue-size muted">${esc(m.size)}</span>
+          ${m.installed
+            ? '<span class="catalogue-badge installed">✓</span>'
+            : `<button class="btn-pull" data-model="${esc(m.name)}">↓</button>`}
+        </div>
+      </div>
+    `).join('');
+
+    catalogueList.querySelectorAll('.btn-pull').forEach(btn => {
+      btn.addEventListener('click', () => pullModel(btn.dataset.model, btn));
+    });
+  } catch (err) {
+    catalogueList.innerHTML = `<span class="muted">Error: ${esc(String(err))}</span>`;
+  }
+}
+
+async function pullModel(modelName, btn) {
+  const row = btn.closest('.catalogue-row');
+  const progress = document.createElement('div');
+  progress.className = 'pull-progress';
+  btn.replaceWith(progress);
+
+  try {
+    const resp = await fetch('/api/models/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelName }),
+    });
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const raw = line.slice(5).trim();
+        if (!raw) continue;
+        try {
+          const chunk = JSON.parse(raw);
+          if (chunk.error) { progress.textContent = `Error: ${chunk.error}`; return; }
+          if (chunk.total && chunk.completed) {
+            const pct = Math.round((chunk.completed / chunk.total) * 100);
+            progress.textContent = `${pct}%`;
+          } else if (chunk.status) {
+            progress.textContent = chunk.status;
+          }
+        } catch { /* skip */ }
+      }
+    }
+
+    // Refresh catalogue and model dropdown after successful pull
+    await loadCatalogue();
+    await loadModels();
+  } catch (err) {
+    progress.textContent = `Error: ${err}`;
+  }
+}
 
 // ─── Status bar ───────────────────────────────────────────────────────────────
 // Shows a persistent status bar above messages with elapsed time.
