@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TalkIR — Security Log Intelligence</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="shell">
+
+    <!-- ── Sidebar ─────────────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span class="logo">⬡ TalkIR</span>
+        <span class="logo-sub">Log Intelligence</span>
+      </div>
+
+      <section class="sidebar-section">
+        <div class="section-title">
+          Data Views
+          <button class="btn-icon" id="refreshIndices" title="Refresh">↻</button>
+        </div>
+        <div id="indicesList" class="indices-list">
+          <span class="muted">Loading…</span>
+        </div>
+        <div class="index-controls">
+          <label class="check-label">
+            <input type="checkbox" id="selectAll" /> All data views
+          </label>
+        </div>
+      </section>
+
+      <section class="sidebar-section">
+        <div class="section-title">Results per query</div>
+        <div class="results-row">
+          <input type="range" id="maxResults" min="5" max="50" value="15" step="5" />
+          <span id="maxResultsVal" class="muted">15</span>
+        </div>
+        <label class="check-label" style="margin-top:6px">
+          <input type="checkbox" id="allResults" />
+          All results
+        </label>
+      </section>
+
+      <section class="sidebar-section">
+        <div class="section-title">Provider</div>
+        <select id="providerSelect" class="model-select">
+          <option value="ollama">Ollama (local)</option>
+          <option value="claude">Claude (Anthropic)</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <select id="modelSelect" class="model-select" style="margin-top:6px">
+          <option value="">Loading…</option>
+        </select>
+      </section>
+
+      <section class="sidebar-section bottom">
+        <button class="btn-secondary" id="clearChat">Clear chat</button>
+      </section>
+    </aside>
+
+    <!-- ── Chat pane ───────────────────────────────────────────────── -->
+    <main class="chat-pane">
+      <header class="chat-header">
+        <span>Ask about your security events</span>
+        <span id="modelBadge" class="badge">model: …</span>
+      </header>
+
+      <div id="chatStatus" class="chat-status" hidden>
+        <span id="chatStatusIcon" class="status-icon">⟳</span>
+        <span id="chatStatusText"></span>
+        <span id="chatStatusTimer" class="status-timer"></span>
+      </div>
+
+      <div id="messages" class="messages">
+        <div class="msg assistant">
+          <div class="bubble">
+            Hello! Drop <code>.json</code> log files into the <code>./logs/</code> folder,
+            select one or more indices on the left, then ask me anything about the events —
+            threat hunting, anomaly analysis, MITRE ATT&CK mapping, you name it.
+          </div>
+        </div>
+      </div>
+
+      <form class="input-bar" id="chatForm" autocomplete="off">
+        <textarea
+          id="queryInput"
+          rows="1"
+          placeholder="e.g. Are there signs of lateral movement in the last 24 hours?"
+          required
+        ></textarea>
+        <button type="submit" id="sendBtn">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

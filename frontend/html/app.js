@@ -1,0 +1,448 @@
+'use strict';
+
+// ─── State ────────────────────────────────────────────────────────────────────
+const state = {
+  conversationHistory: [],
+  streaming: false,
+};
+
+// ─── DOM refs ─────────────────────────────────────────────────────────────────
+const messagesEl      = document.getElementById('messages');
+const chatForm        = document.getElementById('chatForm');
+const queryInput      = document.getElementById('queryInput');
+const sendBtn         = document.getElementById('sendBtn');
+const indicesList     = document.getElementById('indicesList');
+const selectAllCb     = document.getElementById('selectAll');
+const maxResultsInput = document.getElementById('maxResults');
+const maxResultsVal   = document.getElementById('maxResultsVal');
+const allResultsCb    = document.getElementById('allResults');
+const refreshBtn      = document.getElementById('refreshIndices');
+const clearBtn        = document.getElementById('clearChat');
+const modelBadge      = document.getElementById('modelBadge');
+const providerSelect  = document.getElementById('providerSelect');
+const modelSelect     = document.getElementById('modelSelect');
+const chatStatusEl    = document.getElementById('chatStatus');
+const chatStatusIcon  = document.getElementById('chatStatusIcon');
+const chatStatusText  = document.getElementById('chatStatusText');
+const chatStatusTimer = document.getElementById('chatStatusTimer');
+
+// ─── Initialise ───────────────────────────────────────────────────────────────
+loadIndices();
+loadModelInfo();
+loadModels();
+providerSelect.addEventListener('change', onProviderChange);
+
+maxResultsInput.addEventListener('input', () => {
+  maxResultsVal.textContent = maxResultsInput.value;
+});
+
+allResultsCb.addEventListener('change', () => {
+  maxResultsInput.disabled = allResultsCb.checked;
+  maxResultsVal.textContent = allResultsCb.checked ? 'All' : maxResultsInput.value;
+});
+
+// Auto-resize textarea
+queryInput.addEventListener('input', () => {
+  queryInput.style.height = 'auto';
+  queryInput.style.height = Math.min(queryInput.scrollHeight, 140) + 'px';
+});
+
+// Submit on Enter (Shift+Enter = newline)
+queryInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (!state.streaming) chatForm.requestSubmit();
+  }
+});
+
+refreshBtn.addEventListener('click', loadIndices);
+clearBtn.addEventListener('click', clearChat);
+selectAllCb.addEventListener('change', toggleSelectAll);
+chatForm.addEventListener('submit', handleSubmit);
+
+// ─── Indices ──────────────────────────────────────────────────────────────────
+async function loadIndices() {
+  indicesList.innerHTML = '<span class="muted">Loading…</span>';
+  try {
+    const resp = await fetch('/api/indices');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const indices = await resp.json();
+
+    if (indices.length === 0) {
+      indicesList.innerHTML = '<span class="muted">No indices yet — drop .json files into ./logs/</span>';
+      return;
+    }
+
+    indicesList.innerHTML = indices.map(idx => `
+      <label class="check-label">
+        <input type="checkbox" class="index-cb" value="${esc(idx.name)}" checked />
+        ${esc(idx.name)}
+        <span class="index-meta">${idx.doc_count.toLocaleString()} docs</span>
+      </label>
+    `).join('');
+  } catch (err) {
+    indicesList.innerHTML = `<span class="muted">Error: ${esc(String(err))}</span>`;
+  }
+}
+
+function getSelectedIndices() {
+  return [...document.querySelectorAll('.index-cb:checked')].map(cb => cb.value);
+}
+
+function toggleSelectAll() {
+  document.querySelectorAll('.index-cb').forEach(cb => {
+    cb.checked = selectAllCb.checked;
+  });
+}
+
+// ─── Model info ───────────────────────────────────────────────────────────────
+async function loadModelInfo() {
+  try {
+    const resp = await fetch('/api/info');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.model) modelBadge.textContent = `model: ${data.model}`;
+  } catch { /* ignore */ }
+}
+
+const CLOUD_MODELS = {
+  claude: [
+    'claude-opus-4-6',
+    'claude-sonnet-4-6',
+    'claude-haiku-4-5-20251001',
+  ],
+  openai: [
+    'gpt-4o',
+    'gpt-4o-mini',
+    'gpt-4-turbo',
+  ],
+};
+
+async function loadModels() {
+  try {
+    const resp = await fetch('/api/models');
+    if (!resp.ok) return;
+    const ollamaModels = await resp.json();
+
+    const infoResp = await fetch('/api/info');
+    const info = infoResp.ok ? await infoResp.json() : {};
+    const defaultModel = info.model || '';
+
+    // Store Ollama models for later switching
+    providerSelect._ollamaModels = ollamaModels;
+    providerSelect._ollamaDefault = defaultModel;
+
+    populateModels('ollama');
+
+    modelSelect.addEventListener('change', () => {
+      updateBadge();
+    });
+  } catch { /* ignore */ }
+}
+
+function populateModels(provider) {
+  if (provider === 'ollama') {
+    const models = providerSelect._ollamaModels || [];
+    const def    = providerSelect._ollamaDefault || '';
+    modelSelect.innerHTML = models.length
+      ? models.map(m => `<option value="${esc(m)}" ${m === def ? 'selected' : ''}>${esc(m)}</option>`).join('')
+      : '<option value="">No local models found</option>';
+  } else {
+    const models = CLOUD_MODELS[provider] || [];
+    modelSelect.innerHTML = models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+  }
+  updateBadge();
+}
+
+function onProviderChange() {
+  populateModels(providerSelect.value);
+}
+
+function updateBadge() {
+  const provider = providerSelect.value;
+  const model    = modelSelect.value;
+  const label    = provider === 'ollama' ? model : `${provider}: ${model}`;
+  modelBadge.textContent = `model: ${label}`;
+}
+
+function getSelectedModel()    { return modelSelect.value || ''; }
+function getSelectedProvider() { return providerSelect.value || 'ollama'; }
+
+// ─── Status bar ───────────────────────────────────────────────────────────────
+// Shows a persistent status bar above messages with elapsed time.
+// Completely independent of the response bubble.
+let _thinkingTimer = null;
+let _thinkingStart = 0;
+let _thinkingBase  = '';
+
+let _statusBubble = null;
+
+function startThinkingTimer(bubble, text) {
+  _statusBubble  = bubble;
+  _thinkingBase  = text;
+  _thinkingStart = Date.now();
+  _updateThinking();
+  _thinkingTimer = setInterval(_updateThinking, 250);
+}
+
+function _updateThinking() {
+  if (!_statusBubble) return;
+  const secs = Math.floor((Date.now() - _thinkingStart) / 1000);
+  _statusBubble.textContent = secs > 0 ? `${_thinkingBase} (${secs}s)` : _thinkingBase;
+}
+
+function stopThinkingTimer() {
+  clearInterval(_thinkingTimer);
+  _thinkingTimer = null;
+  _statusBubble  = null;
+}
+
+// ─── Chat ─────────────────────────────────────────────────────────────────────
+async function handleSubmit(e) {
+  e.preventDefault();
+  const query = queryInput.value.trim();
+  if (!query || state.streaming) return;
+
+  const indices    = getSelectedIndices();
+  const maxResults = allResultsCb.checked ? 10000 : parseInt(maxResultsInput.value, 10);
+  const model      = getSelectedModel();
+  const provider   = getSelectedProvider();
+
+  appendMessage('user', query);
+  state.conversationHistory.push({ role: 'user', content: query });
+  queryInput.value = '';
+  queryInput.style.height = 'auto';
+
+  // Context message — separate chat element, appears before the response
+  const contextMsg = document.createElement('div');
+  contextMsg.className = 'msg context-msg';
+  contextMsg.hidden = true;
+  const contextDetails = document.createElement('details');
+  contextDetails.className = 'think-block context-block';
+  const contextSummary = document.createElement('summary');
+  contextDetails.appendChild(contextSummary);
+  const contextBody = document.createElement('div');
+  contextBody.className = 'think-body';
+  contextDetails.appendChild(contextBody);
+  contextMsg.appendChild(contextDetails);
+  messagesEl.appendChild(contextMsg);
+
+  // Assistant message wrapper
+  const msgEl = document.createElement('div');
+  msgEl.className = 'msg assistant';
+  messagesEl.appendChild(msgEl);
+
+  // Status bubble (shown while waiting)
+  const statusBubble = document.createElement('div');
+  statusBubble.className = 'bubble status';
+  msgEl.appendChild(statusBubble);
+
+  // Thinking block (hidden until <think> tokens arrive)
+  const thinkDetails = document.createElement('details');
+  thinkDetails.className = 'think-block';
+  thinkDetails.hidden = true;
+  thinkDetails.innerHTML = '<summary>Reasoning</summary>';
+  const thinkBody = document.createElement('div');
+  thinkBody.className = 'think-body';
+  thinkDetails.appendChild(thinkBody);
+  msgEl.appendChild(thinkDetails);
+
+  // Response bubble (shown when content arrives)
+  const assistantBubble = document.createElement('div');
+  assistantBubble.className = 'bubble cursor';
+  assistantBubble.hidden = true;
+  msgEl.appendChild(assistantBubble);
+
+  // Live stats footer — shown during generation, replaced by final stats when done
+  const liveStats = document.createElement('div');
+  liveStats.className = 'msg-stats';
+  liveStats.hidden = true;
+  msgEl.appendChild(liveStats);
+
+  let tokenCount  = 0;
+  let genStart    = 0;
+  let statsTimer  = null;
+
+  function startGenStats() {
+    genStart = Date.now();
+    liveStats.hidden = false;
+    statsTimer = setInterval(() => {
+      const secs = ((Date.now() - genStart) / 1000).toFixed(1);
+      const rate = genStart ? (tokenCount / ((Date.now() - genStart) / 1000)).toFixed(1) : 0;
+      liveStats.textContent = `${tokenCount} tokens · ${rate} tok/s · ${secs}s`;
+    }, 250);
+  }
+
+  function stopGenStats(finalStats) {
+    clearInterval(statsTimer);
+    statsTimer = null;
+    if (finalStats && finalStats.tokens) {
+      const s = finalStats;
+      const parts = [`${s.tokens} tokens`];
+      if (s.tokens_per_sec) parts.push(`${s.tokens_per_sec} tok/s`);
+      if (s.duration_sec)   parts.push(`${s.duration_sec}s`);
+      liveStats.textContent = parts.join(' · ');
+    } else {
+      liveStats.hidden = true;
+    }
+  }
+
+  setStreaming(true);
+  startThinkingTimer(statusBubble, 'Sending request…');
+  scrollToBottom();
+
+  let hasContent  = false;
+  let fullReply   = '';
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        indices,
+        max_results: maxResults,
+        conversation_history: state.conversationHistory.slice(-20),
+        model,
+        provider,
+      }),
+    });
+
+    if (!resp.ok) {
+      stopThinkingTimer();
+      statusBubble.remove();
+      appendMessage('error', `Server error ${resp.status}: ${await resp.text()}`);
+      return;
+    }
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer    = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const raw = line.slice(5).trim();
+        if (!raw) continue;
+        try {
+          const chunk = JSON.parse(raw);
+
+          if (chunk.error) {
+            stopThinkingTimer();
+            statusBubble.remove();
+            appendMessage('error', chunk.error);
+            return;
+          }
+
+          if (chunk.status) {
+            _thinkingBase = formatStatus(chunk);
+            _updateThinking();
+          }
+
+          if (chunk.context) {
+            const n = chunk.context.length;
+            contextSummary.textContent = `${n} record${n === 1 ? '' : 's'} sent to LLM`;
+            contextBody.textContent = chunk.context
+              .map((e, i) => `[${i + 1}] ${JSON.stringify(e, null, 2)}`)
+              .join('\n\n');
+            contextMsg.hidden = false;
+            scrollToBottom();
+          }
+
+          if (chunk.thinking) {
+            thinkDetails.hidden = false;
+            thinkBody.textContent += chunk.thinking;
+            scrollToBottom();
+          }
+
+          if (chunk.content !== undefined && (chunk.content || chunk.done)) {
+            if (!hasContent) {
+              hasContent = true;
+              stopThinkingTimer();
+              statusBubble.hidden = true;
+              assistantBubble.hidden = false;
+              startGenStats();
+            }
+            if (chunk.content) {
+              tokenCount++;
+              fullReply += chunk.content;
+              assistantBubble.textContent = fullReply;
+            }
+            if (chunk.done) {
+              assistantBubble.classList.remove('cursor');
+              stopGenStats(chunk.stats);
+            }
+            scrollToBottom();
+          }
+        } catch { /* malformed chunk */ }
+      }
+    }
+
+    assistantBubble.classList.remove('cursor');
+    state.conversationHistory.push({ role: 'assistant', content: fullReply });
+
+  } catch (err) {
+    stopThinkingTimer();
+    stopGenStats(null);
+    assistantBubble.classList.remove('cursor');
+    appendMessage('error', String(err));
+  } finally {
+    stopThinkingTimer();
+    clearInterval(statsTimer);
+    setStreaming(false);
+  }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function appendMessage(role, text, returnBubble = false) {
+  const msg    = document.createElement('div');
+  msg.className = `msg ${role}`;
+  const bubble  = document.createElement('div');
+  bubble.className = 'bubble';
+  if (role === 'assistant') bubble.classList.add('cursor');
+  bubble.textContent = text;
+  msg.appendChild(bubble);
+  messagesEl.appendChild(msg);
+  scrollToBottom();
+  return returnBubble ? bubble : msg;
+}
+
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function setStreaming(val) {
+  state.streaming    = val;
+  sendBtn.disabled   = val;
+  queryInput.disabled = val;
+}
+
+function clearChat() {
+  state.conversationHistory = [];
+  messagesEl.innerHTML = '';
+  appendMessage('assistant', 'Chat cleared. Ready for your next query.');
+}
+
+function formatStatus(chunk) {
+  if (chunk.status === 'searching') {
+    const n = chunk.indices;
+    return `Searching ${n === 0 ? 'all' : n} ${n === 1 ? 'index' : 'indices'}…`;
+  }
+  if (chunk.status === 'found') {
+    return chunk.count > 0
+      ? `Found ${chunk.count} event${chunk.count === 1 ? '' : 's'} — generating response…`
+      : 'No matching events — generating response…';
+  }
+  return 'Working…';
+}
+
+function esc(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}

@@ -1,0 +1,297 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Volumes
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  certs:          # TLS certificates shared across services
+  esdata:         # Elasticsearch data
+  kibanadata:     # Kibana state
+  ollama_data:    # Downloaded LLM model weights
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Networks
+#
+#  internal  — isolated bridge (internal: true). No external/internet routing.
+#              Used for all service-to-service traffic. Containers here cannot
+#              be reached from the host unless they are ALSO on `public`.
+#
+#  public    — standard bridge with internet access via Docker NAT.
+#              Only services that need host port bindings or internet access
+#              (Ollama model downloads) are attached here.
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+  internal:
+    driver: bridge
+    internal: true          # no external routing — containers cannot reach internet
+  public:
+    driver: bridge          # internet-capable; used for host port bindings + Ollama
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ── Certificate generation (runs once, then exits) ─────────────────────────
+  # Needs: reach elasticsearch (internal). No internet, no host ports.
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    networks:
+      - internal
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD}
+    command: |
+      bash -c '
+        set -e
+
+        # Validate required env vars (read from container environment, not compose-expanded)
+        [ -z "$$ELASTIC_PASSWORD" ] && echo "ERROR: Set ELASTIC_PASSWORD in .env" && exit 1
+        [ -z "$$KIBANA_PASSWORD" ]  && echo "ERROR: Set KIBANA_PASSWORD in .env"  && exit 1
+
+        # Generate CA (idempotent)
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "==> Generating CA..."
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip
+          unzip config/certs/ca.zip -d config/certs
+        fi
+
+        # Generate node + Kibana certificates (idempotent)
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "==> Generating node and client certificates..."
+          printf "instances:\n- name: elasticsearch\n  dns:\n  - elasticsearch\n  - localhost\n  ip:\n  - 127.0.0.1\n- name: kibana\n  dns:\n  - kibana\n  - localhost\n  ip:\n  - 127.0.0.1\n" > config/certs/instances.yml
+          bin/elasticsearch-certutil cert --silent --pem \
+            -out config/certs/certs.zip \
+            --in  config/certs/instances.yml \
+            --ca-cert config/certs/ca/ca.crt \
+            --ca-key  config/certs/ca/ca.key
+          unzip config/certs/certs.zip -d config/certs
+        fi
+
+        # Secure cert permissions (world-readable so non-root containers can use them)
+        chown -R root:root config/certs
+        find config/certs -type d -exec chmod 755 {} \;
+        find config/certs -type f -exec chmod 644 {} \;
+
+        # Wait for elasticsearch then set kibana_system password
+        echo "==> Waiting for Elasticsearch..."
+        until curl -s --cacert config/certs/ca/ca.crt \
+            https://elasticsearch:9200 | grep -q "missing authentication credentials"; do
+          sleep 10
+        done
+
+        echo "==> Setting kibana_system password..."
+        until curl -sf -X POST \
+            --cacert config/certs/ca/ca.crt \
+            -u "elastic:$$ELASTIC_PASSWORD" \
+            -H "Content-Type: application/json" \
+            https://elasticsearch:9200/_security/user/kibana_system/_password \
+            -d "{\"password\":\"$$KIBANA_PASSWORD\"}" | grep -q "^{}"; do
+          sleep 5
+        done
+
+        echo "==> Setup complete."
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/certs.zip ]"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # ── Elasticsearch (single node) ─────────────────────────────────────────────
+  # discovery.type=single-node skips cluster bootstrap — no quorum needed.
+  # mTLS: client_authentication=optional — verifies Kibana's cert when presented.
+  elasticsearch:
+    depends_on:
+      setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "${ES_PORT:-9200}:9200"
+    networks:
+      - internal
+      - public
+    environment:
+      - node.name=elasticsearch
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=false
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/elasticsearch/elasticsearch.key
+      - xpack.security.http.ssl.certificate=certs/elasticsearch/elasticsearch.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.http.ssl.client_authentication=optional   # mTLS: verify client certs when presented (Kibana)
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/elasticsearch/elasticsearch.key
+      - xpack.security.transport.ssl.certificate=certs/elasticsearch/elasticsearch.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE:-basic}
+    mem_limit: ${MEM_LIMIT:-1073741824}
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Kibana ──────────────────────────────────────────────────────────────────
+  # Needs: elasticsearch on internal. Host port 5601 → public too.
+  # mTLS: presents kibana/kibana.crt as client cert to Elasticsearch.
+  kibana:
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/kibana/config/certs:ro
+      - kibanadata:/usr/share/kibana/data
+    ports:
+      - "${KIBANA_PORT:-5601}:5601"
+    networks:
+      - internal
+      - public
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      # Server-side TLS verification — trust only our CA
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+      # mTLS: Kibana's client certificate presented to Elasticsearch
+      - ELASTICSEARCH_SSL_CERTIFICATE=${KIBANA_ES_CERT:-config/certs/kibana/kibana.crt}
+      - ELASTICSEARCH_SSL_KEY=${KIBANA_ES_KEY:-config/certs/kibana/kibana.key}
+      - XPACK_SECURITY_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+      - XPACK_REPORTING_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+      - SERVER_SSL_ENABLED=false       # HTTP on 5601 — add your own reverse proxy for HTTPS
+    mem_limit: ${MEM_LIMIT:-1073741824}
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -sf http://localhost:5601/api/status | grep -q '\"overall\":{\"level\":\"available\"'"
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── Fluent Bit ─────────────────────────────────────────────────────────────
+  # Needs: elasticsearch on internal. No host ports, no internet.
+  fluent-bit:
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    build:
+      context: ./fluent-bit
+      dockerfile: Dockerfile
+    volumes:
+      - certs:/certs:ro
+      - ./logs:/logs:ro          # bind-mount: drop .json files here on the host
+    networks:
+      - internal
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    restart: unless-stopped
+
+  # ── Ollama (CPU LLM) ────────────────────────────────────────────────────────
+  # Uses the base image directly — do not override the entrypoint.
+  # Needs: public for internet (model download by ollama-pull). internal for api.
+  # Host port 11434 → public (direct model management from host).
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    networks:
+      - internal
+      - public
+    # ── GPU support (NVIDIA only in Docker on Windows/WSL2) — uncomment to enable ──
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ── Ollama model pull (one-shot) ─────────────────────────────────────────────
+  # Runs once after ollama is healthy, pulls the configured model, then exits.
+  # api waits for this to complete so the model is ready before serving requests.
+  # Uses the internal network only — the pull request goes to ollama:11434 and
+  # ollama itself downloads the weights via its own public network connection.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - internal
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["ollama", "pull"]
+    command: "${OLLAMA_MODEL:-llama3.2:3b}"
+    restart: on-failure
+
+  # ── Chat API ────────────────────────────────────────────────────────────────
+  # Needs: elasticsearch and ollama on internal. No host ports (proxied via frontend).
+  api:
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    volumes:
+      - certs:/certs:ro
+    networks:
+      - internal
+    environment:
+      - ES_HOST=https://elasticsearch:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_CA_CERT_PATH=/certs/ca/ca.crt
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ── Frontend (nginx) ────────────────────────────────────────────────────────
+  # Needs: api on internal. Host port 3000 → public.
+  frontend:
+    depends_on:
+      api:
+        condition: service_healthy
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    networks:
+      - internal
+      - public
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+{"timestamp":"2024-01-15T08:23:11.000Z","event_type":"login_failure","user":"administrator","src_ip":"185.220.101.45","dst_host":"dc01.corp.local","protocol":"ssh","attempts":1,"country":"RU","asn":"AS205100"}
+{"timestamp":"2024-01-15T08:23:14.000Z","event_type":"login_failure","user":"administrator","src_ip":"185.220.101.45","dst_host":"dc01.corp.local","protocol":"ssh","attempts":2,"country":"RU","asn":"AS205100"}
+{"timestamp":"2024-01-15T08:23:17.000Z","event_type":"login_failure","user":"administrator","src_ip":"185.220.101.45","dst_host":"dc01.corp.local","protocol":"ssh","attempts":3,"country":"RU","asn":"AS205100"}
+{"timestamp":"2024-01-15T08:23:20.000Z","event_type":"login_failure","user":"root","src_ip":"185.220.101.45","dst_host":"dc01.corp.local","protocol":"ssh","attempts":4,"country":"RU","asn":"AS205100"}
+{"timestamp":"2024-01-15T08:45:03.000Z","event_type":"login_success","user":"jsmith","src_ip":"10.0.1.50","dst_host":"dc01.corp.local","protocol":"kerberos","session_id":"krb5-abc123","country":"US"}
+{"timestamp":"2024-01-15T09:12:44.000Z","event_type":"privilege_escalation","user":"jsmith","src_ip":"10.0.1.50","dst_host":"fileserver01.corp.local","action":"sudo","command":"/bin/bash","session_id":"krb5-abc123"}
+{"timestamp":"2024-01-15T09:14:01.000Z","event_type":"file_access","user":"jsmith","src_ip":"10.0.1.50","dst_host":"fileserver01.corp.local","file_path":"/etc/shadow","action":"read","session_id":"krb5-abc123"}
+{"timestamp":"2024-01-15T09:15:33.000Z","event_type":"network_connection","src_ip":"10.0.1.50","dst_ip":"185.220.101.45","dst_port":4444,"protocol":"tcp","bytes_sent":204800,"process":"python3","pid":14221}

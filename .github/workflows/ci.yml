@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ── 1. Lint Dockerfiles ──────────────────────────────────────────────────────
+  lint-dockerfiles:
+    name: Lint Dockerfiles (hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run hadolint on all Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          failure-threshold: warning
+
+  # ── 2. Validate docker-compose ───────────────────────────────────────────────
+  validate-compose:
+    name: Validate docker-compose.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Validate compose config
+        run: docker compose config --quiet
+
+  # ── 3. API unit tests ────────────────────────────────────────────────────────
+  test-api:
+    name: API unit tests (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: api/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        run: pytest tests/ -v --cov=app --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+
+  # ── 4. Fluent Bit Lua syntax check ──────────────────────────────────────────
+  lint-lua:
+    name: Lua syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install luac
+        run: sudo apt-get install -y lua5.4
+
+      - name: Check Lua syntax
+        run: luac5.4 -p fluent-bit/extract_index.lua
+
+  # ── 5. Security scanning ─────────────────────────────────────────────────────
+  security-scan:
+    name: Container vulnerability scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: [lint-dockerfiles, validate-compose]
+    strategy:
+      matrix:
+        context:
+          - { path: "api",        tag: "talkir-api" }
+          - { path: "frontend",   tag: "talkir-frontend" }
+          - { path: "fluent-bit", tag: "talkir-fluentbit" }
+          - { path: "ollama",     tag: "talkir-ollama" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image — ${{ matrix.context.tag }}
+        run: docker build -t ${{ matrix.context.tag }} ${{ matrix.context.path }}/
+
+      - name: Scan with Trivy — ${{ matrix.context.tag }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.context.tag }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+  # ── 6. Secret scanning ───────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret detection (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
