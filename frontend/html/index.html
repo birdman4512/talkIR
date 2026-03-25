@@ -12,97 +12,118 @@
     <!-- ── Sidebar ─────────────────────────────────────────────────── -->
     <aside class="sidebar">
       <div class="sidebar-header">
-        <span class="logo">⬡ TalkIR</span>
-        <span class="logo-sub">Log Intelligence</span>
+        <span class="logo">&gt;_ TalkIR</span>
+        <span class="logo-sub">security log intelligence</span>
       </div>
 
       <section class="sidebar-section">
         <div class="section-title">
-          Data Views
+          // data views
           <button class="btn-icon" id="refreshIndices" title="Refresh">↻</button>
         </div>
         <div id="indicesList" class="indices-list">
-          <span class="muted">Loading…</span>
+          <span class="muted">loading…</span>
         </div>
         <div class="index-controls">
           <label class="check-label">
-            <input type="checkbox" id="selectAll" /> All data views
+            <input type="checkbox" id="selectAll" /> all indices
           </label>
         </div>
       </section>
 
       <section class="sidebar-section">
-        <div class="section-title">Results per query</div>
-        <div class="results-row">
-          <input type="range" id="maxResults" min="5" max="50" value="15" step="5" />
-          <span id="maxResultsVal" class="muted">15</span>
+        <div class="section-title">// query</div>
+        <label class="check-label">
+          <input type="checkbox" id="smartQuery" checked />
+          smart query (llm-generated)
+        </label>
+        <label class="check-label" style="margin-top:4px">
+          <input type="checkbox" id="conciseMode" />
+          concise answers
+        </label>
+        <div class="results-row" style="margin-top:10px">
+          <span class="muted" style="font-size:11px;white-space:nowrap">results</span>
+          <input type="range" id="maxResults" min="5" max="200" value="20" step="5" />
+          <span id="maxResultsVal" class="muted">20</span>
         </div>
-        <label class="check-label" style="margin-top:6px">
+        <label class="check-label" style="margin-top:4px">
           <input type="checkbox" id="allResults" />
-          All results
+          all results
         </label>
       </section>
 
       <section class="sidebar-section">
-        <div class="section-title">Provider</div>
+        <div class="section-title">// provider</div>
         <select id="providerSelect" class="model-select">
-          <option value="ollama">Ollama (local)</option>
-          <option value="claude">Claude (Anthropic)</option>
-          <option value="openai">OpenAI</option>
+          <option value="ollama">ollama (local)</option>
+          <option value="claude">claude (anthropic)</option>
+          <option value="openai">openai</option>
         </select>
         <select id="modelSelect" class="model-select" style="margin-top:6px">
-          <option value="">Loading…</option>
+          <option value="">loading…</option>
         </select>
       </section>
 
-      <section class="sidebar-section" id="catalogueSection">
-        <div class="section-title">
-          Local models
-          <button class="btn-icon" id="refreshCatalogue" title="Refresh">↻</button>
-        </div>
-        <div id="catalogueList" class="catalogue-list">
-          <span class="muted">Loading…</span>
-        </div>
-      </section>
+      <div class="resize-handle" id="resizeHandle"></div>
 
       <section class="sidebar-section bottom">
-        <button class="btn-secondary" id="clearChat">Clear chat</button>
+        <div class="bottom-actions">
+          <button class="btn-term" id="clearChat">[ clear ]</button>
+          <button class="btn-term" id="openSettings">[ cfg ]</button>
+        </div>
       </section>
     </aside>
 
     <!-- ── Chat pane ───────────────────────────────────────────────── -->
     <main class="chat-pane">
       <header class="chat-header">
-        <span>Ask about your security events</span>
+        <span class="chat-header-prompt"><span class="accent">talkir</span>@security:~$</span>
         <span id="modelBadge" class="badge">model: …</span>
       </header>
-
-      <div id="chatStatus" class="chat-status" hidden>
-        <span id="chatStatusIcon" class="status-icon">⟳</span>
-        <span id="chatStatusText"></span>
-        <span id="chatStatusTimer" class="status-timer"></span>
-      </div>
 
       <div id="messages" class="messages">
         <div class="msg assistant">
           <div class="bubble">
-            Hello! Drop <code>.json</code> log files into the <code>./logs/</code> folder,
-            select one or more indices on the left, then ask me anything about the events —
-            threat hunting, anomaly analysis, MITRE ATT&CK mapping, you name it.
+            ready. drop <code>.json</code> log files into <code>./logs/</code>,
+            select indices on the left, then query your events —
+            threat hunting, anomaly analysis, MITRE ATT&amp;CK mapping, you name it.
           </div>
         </div>
       </div>
 
       <form class="input-bar" id="chatForm" autocomplete="off">
+        <span class="input-prompt">&gt;</span>
         <textarea
           id="queryInput"
           rows="1"
-          placeholder="e.g. Are there signs of lateral movement in the last 24 hours?"
+          placeholder="e.g. are there signs of lateral movement in the last 24 hours?"
           required
         ></textarea>
-        <button type="submit" id="sendBtn">Send</button>
+        <button type="button" id="stopBtn" hidden>[ ■ ]</button>
+        <button type="submit" id="sendBtn">exec</button>
       </form>
     </main>
+  </div>
+
+  <!-- ── Settings modal ─────────────────────────────────────────── -->
+  <div id="settingsModal" class="settings-overlay">
+    <div class="settings-panel">
+      <div class="settings-header">
+        <span>[ configuration ]</span>
+        <button class="btn-icon" id="closeSettings">✕</button>
+      </div>
+      <div class="settings-body">
+        <div class="settings-section">
+          <div class="section-title">
+            // local models
+            <button class="btn-icon" id="refreshCatalogue" title="Refresh">↻</button>
+          </div>
+          <div id="catalogueList" class="catalogue-list">
+            <span class="muted">loading…</span>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="app.js"></script>

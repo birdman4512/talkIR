@@ -1,5 +1,7 @@
 import json
+import re
 import httpx
+from string import Template
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
@@ -27,8 +29,177 @@ When analysing security events:
 
 You will be given raw log events retrieved from Elasticsearch. Analyse them carefully and answer the user's question."""
 
+QUERY_GEN_PROMPT = Template("""Generate an Elasticsearch Query DSL JSON body for this security log query.
 
-async def _search_context(indices: list[str], query: str, max_results: int) -> list[dict]:
+Output ONLY a valid JSON object — no markdown, no explanation.
+
+Rules:
+- Must have a "query" key. Max size: $max_results.
+- Use only exact field names from the list below. No wildcards as field names.
+- No join queries (has_child, has_parent, nested) — documents are flat.
+- The "query" value must contain EXACTLY ONE top-level key (e.g. "bool", "match", "term", "exists"). NEVER put two query types as sibling keys.
+- To combine conditions use bool.must / bool.should / bool.filter arrays.
+- For "list/show/summarise/relationship" queries: use match_all + _source with relevant fields.
+- Do not invent specific values unless the user names them.
+
+Fields ($indices): $fields
+
+Example — "users signing in from 1.2.3.4":
+{"query":{"bool":{"must":[{"term":{"IpAddress":"1.2.3.4"}},{"exists":{"field":"UserName"}}]}},"_source":["UserName","IpAddress","@timestamp"],"size":20}""")
+
+
+def _collect_fields(props: dict, prefix: str, out: list):
+    for name, data in props.items():
+        full = f"{prefix}.{name}" if prefix else name
+        out.append(full)
+        if "properties" in data:
+            _collect_fields(data["properties"], full, out)
+
+
+async def _get_mapping_fields(es, indices: list[str]) -> str:
+    """Return a compact comma-separated list of actual field names from ES mappings."""
+    try:
+        target = ",".join(indices[:5]) if indices else "_all"
+        mapping = await es.indices.get_mapping(index=target)
+        fields: list[str] = []
+        for idx_data in mapping.values():
+            props = idx_data.get("mappings", {}).get("properties", {})
+            _collect_fields(props, "", fields)
+        # Deduplicate and cap
+        seen: set[str] = set()
+        unique = []
+        for f in fields:
+            if f not in seen:
+                seen.add(f)
+                unique.append(f)
+        return ", ".join(unique[:30]) if unique else "(unavailable)"
+    except Exception:
+        return "(unavailable)"
+
+
+def _sanitize_query_body(body: dict) -> dict:
+    """Fix the common LLM mistake of putting multiple sibling keys inside 'query'."""
+    q = body.get("query", {})
+    if isinstance(q, dict) and len(q) > 1:
+        # Wrap all sibling clauses into bool.must
+        body["query"] = {"bool": {"must": [{k: v} for k, v in q.items()]}}
+    return body
+
+
+def _extract_json(text: str) -> dict | None:
+    """Pull a JSON object out of freeform LLM output."""
+    text = text.strip()
+    # Direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Strip markdown code fences
+    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    # Find outermost JSON object
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+async def _llm_complete(provider: str, model: str, system: str, user: str) -> str:
+    """Single non-streaming LLM call — returns the full text response."""
+    messages = [{"role": "user", "content": user}]
+
+    if provider == "claude":
+        if not settings.anthropic_api_key:
+            return ""
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={"model": model, "max_tokens": 2048, "system": system, "messages": messages},
+            )
+            data = resp.json()
+            return data.get("content", [{}])[0].get("text", "")
+
+    elif provider == "openai":
+        if not settings.openai_api_key:
+            return ""
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "system", "content": system}] + messages},
+            )
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    else:  # ollama
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{settings.ollama_host}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "system", "content": system}] + messages,
+                    "stream": False,
+                },
+            )
+            data = resp.json()
+            if "error" in data:
+                raise ValueError(f"Ollama error: {data['error']}")
+            return data.get("message", {}).get("content", "")
+
+
+async def _smart_search(
+    provider: str, model: str, indices: list[str], query: str, max_results: int
+) -> tuple[list[dict], dict | None, str | None]:
+    """
+    Use the LLM to generate an ES query, run it, and return (events, query_body, fallback_reason).
+    fallback_reason is set if we fell back to keyword search.
+    """
+    es = get_es_client()
+
+    index_str = ", ".join(indices) if indices else "all indices"
+    fields_str = await _get_mapping_fields(es, indices)
+    system = QUERY_GEN_PROMPT.substitute(
+        max_results=max_results,
+        indices=index_str,
+        fields=fields_str,
+    )
+
+    raw = await _llm_complete(provider, model, system, query)
+    query_body = _extract_json(raw)
+
+    if not query_body or "query" not in query_body:
+        # Fall back to keyword search
+        events = await _keyword_search(indices, query, max_results)
+        detail = raw[:500] if raw.strip() else "(model returned no output — possible OOM or context overflow)"
+        return events, None, f"LLM did not return valid query JSON — fell back to keyword search.\n\nLLM output:\n{detail}"
+
+    # Enforce size cap and fix common structural mistakes
+    query_body["size"] = min(query_body.get("size", max_results), max_results)
+    query_body = _sanitize_query_body(query_body)
+
+    try:
+        target = ",".join(indices[:20]) if indices else "_all"
+        result = await es.search(index=target, body=query_body)
+        events = [hit["_source"] for hit in result["hits"]["hits"]]
+        return events, query_body, None
+    except Exception as exc:
+        events = await _keyword_search(indices, query, max_results)
+        return events, query_body, f"Generated query failed ({exc}) — fell back to keyword search."
+
+
+async def _keyword_search(indices: list[str], query: str, max_results: int) -> list[dict]:
     try:
         es = get_es_client()
     except Exception:
@@ -80,7 +251,6 @@ def _partial_tag_suffix(buf: str, tag: str) -> str:
 
 
 async def _stream_ollama(model: str, messages: list[dict]):
-    """Yield (thinking|content, text, done, stats) tuples from Ollama."""
     async with httpx.AsyncClient(timeout=600.0) as client:
         async with client.stream(
             "POST",
@@ -102,6 +272,10 @@ async def _stream_ollama(model: str, messages: list[dict]):
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+                if "error" in chunk:
+                    yield ("error", f"Ollama: {chunk['error']}", False, {})
+                    return
 
                 content = chunk.get("message", {}).get("content", "")
                 done = chunk.get("done", False)
@@ -154,12 +328,10 @@ async def _stream_ollama(model: str, messages: list[dict]):
 
 
 async def _stream_claude(model: str, messages: list[dict]):
-    """Yield (thinking|content, text, done, stats) tuples from Anthropic Claude."""
     if not settings.anthropic_api_key:
         yield ("error", "ANTHROPIC_API_KEY is not set in .env", False, {})
         return
 
-    # Split system message out — Claude API takes it separately
     system = next((m["content"] for m in messages if m["role"] == "system"), "")
     non_system = [m for m in messages if m["role"] != "system"]
 
@@ -172,13 +344,7 @@ async def _stream_claude(model: str, messages: list[dict]):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": model,
-                "max_tokens": 8096,
-                "system": system,
-                "messages": non_system,
-                "stream": True,
-            },
+            json={"model": model, "max_tokens": 8096, "system": system, "messages": non_system, "stream": True},
         ) as response:
             if response.status_code != 200:
                 body = await response.aread()
@@ -205,11 +371,9 @@ async def _stream_claude(model: str, messages: list[dict]):
                     if delta.get("type") == "text_delta":
                         yield ("content", delta.get("text", ""), False, {})
                 elif etype == "message_start":
-                    usage = event.get("message", {}).get("usage", {})
-                    input_tokens = usage.get("input_tokens", 0)
+                    input_tokens = event.get("message", {}).get("usage", {}).get("input_tokens", 0)
                 elif etype == "message_delta":
-                    usage = event.get("usage", {})
-                    output_tokens = usage.get("output_tokens", 0)
+                    output_tokens = event.get("usage", {}).get("output_tokens", 0)
                 elif etype == "message_stop":
                     stats = {"tokens": output_tokens}
                     if input_tokens:
@@ -222,7 +386,6 @@ async def _stream_claude(model: str, messages: list[dict]):
 
 
 async def _stream_openai(model: str, messages: list[dict]):
-    """Yield (thinking|content, text, done, stats) tuples from OpenAI."""
     if not settings.openai_api_key:
         yield ("error", "OPENAI_API_KEY is not set in .env", False, {})
         return
@@ -231,16 +394,8 @@ async def _stream_openai(model: str, messages: list[dict]):
         async with client.stream(
             "POST",
             "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": messages,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            },
+            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True}},
         ) as response:
             if response.status_code != 200:
                 body = await response.aread()
@@ -264,11 +419,9 @@ async def _stream_openai(model: str, messages: list[dict]):
                 usage = chunk.get("usage")
                 if usage:
                     output_tokens = usage.get("completion_tokens", 0)
-
                 choices = chunk.get("choices", [])
                 if choices:
-                    delta = choices[0].get("delta", {})
-                    text = delta.get("content") or ""
+                    text = choices[0].get("delta", {}).get("content") or ""
                     if text:
                         yield ("content", text, False, {})
 
@@ -279,15 +432,46 @@ async def chat(req: ChatRequest):
     model    = req.model or settings.ollama_model
 
     async def stream_response():
-        yield f"data: {json.dumps({'status': 'searching', 'indices': len(req.indices)})}\n\n"
+        # ── Phase 1: resolve indices ────────────────────────────────────────────
+        indices = req.indices
+        if not indices:
+            try:
+                es = get_es_client()
+                resp = await es.cat.indices(format="json", h="index")
+                indices = [i["index"] for i in resp if not i["index"].startswith(".")]
+            except Exception:
+                indices = []
 
-        events = await _search_context(req.indices, req.query, req.max_results)
+        if req.smart_query:
+            # ── Smart query path ────────────────────────────────────────────────
+            yield f"data: {json.dumps({'status': 'generating_query'})}\n\n"
 
-        yield f"data: {json.dumps({'status': 'found', 'count': len(events)})}\n\n"
+            try:
+                events, query_body, fallback_reason = await _smart_search(
+                    provider, model, indices, req.query, req.max_results
+                )
+            except httpx.TimeoutException:
+                yield f"data: {json.dumps({'error': 'Query generation timed out — try a faster model or disable smart query'})}\n\n"
+                return
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': f'Query generation failed: {exc}'})}\n\n"
+                return
 
-        if events:
-            yield f"data: {json.dumps({'context': events})}\n\n"
+            if query_body:
+                yield f"data: {json.dumps({'generated_query': query_body})}\n\n"
+            if fallback_reason:
+                yield f"data: {json.dumps({'query_warning': fallback_reason})}\n\n"
 
+            yield f"data: {json.dumps({'status': 'found', 'count': len(events)})}\n\n"
+        else:
+            # ── Keyword search path ─────────────────────────────────────────────
+            yield f"data: {json.dumps({'status': 'searching', 'indices': len(req.indices)})}\n\n"
+            events = await _keyword_search(indices, req.query, req.max_results)
+            yield f"data: {json.dumps({'status': 'found', 'count': len(events)})}\n\n"
+
+        yield f"data: {json.dumps({'context': events})}\n\n"
+
+        # ── Phase 2: analyse with LLM ───────────────────────────────────────────
         context_block = _build_context_block(events)
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if req.conversation_history:

@@ -4,6 +4,7 @@
 const state = {
   conversationHistory: [],
   streaming: false,
+  abortController: null,
 };
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
@@ -16,25 +17,64 @@ const selectAllCb     = document.getElementById('selectAll');
 const maxResultsInput = document.getElementById('maxResults');
 const maxResultsVal   = document.getElementById('maxResultsVal');
 const allResultsCb    = document.getElementById('allResults');
+const smartQueryCb    = document.getElementById('smartQuery');
+const conciseModeCb   = document.getElementById('conciseMode');
 const refreshBtn      = document.getElementById('refreshIndices');
 const clearBtn        = document.getElementById('clearChat');
-const modelBadge       = document.getElementById('modelBadge');
-const providerSelect   = document.getElementById('providerSelect');
-const modelSelect      = document.getElementById('modelSelect');
-const catalogueList    = document.getElementById('catalogueList');
+const modelBadge      = document.getElementById('modelBadge');
+const providerSelect  = document.getElementById('providerSelect');
+const modelSelect     = document.getElementById('modelSelect');
+const catalogueList   = document.getElementById('catalogueList');
 const refreshCatalogue = document.getElementById('refreshCatalogue');
-const chatStatusEl    = document.getElementById('chatStatus');
-const chatStatusIcon  = document.getElementById('chatStatusIcon');
-const chatStatusText  = document.getElementById('chatStatusText');
-const chatStatusTimer = document.getElementById('chatStatusTimer');
+const openSettingsBtn  = document.getElementById('openSettings');
+const closeSettingsBtn = document.getElementById('closeSettings');
+const settingsModal    = document.getElementById('settingsModal');
+const stopBtn          = document.getElementById('stopBtn');
+
+// ─── Sidebar resize ───────────────────────────────────────────────────────────
+(function () {
+  const handle = document.getElementById('resizeHandle');
+  const shell  = document.querySelector('.shell');
+  const sidebar = document.querySelector('.sidebar');
+  let startX = 0, startW = 0;
+
+  handle.addEventListener('mousedown', (e) => {
+    startX = e.clientX;
+    startW = sidebar.offsetWidth;
+    handle.classList.add('active');
+    document.body.style.cursor    = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(e) {
+      const w = Math.max(160, Math.min(480, startW + (e.clientX - startX)));
+      shell.style.gridTemplateColumns = `${w}px 1fr`;
+    }
+    function onUp() {
+      handle.classList.remove('active');
+      document.body.style.cursor    = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup',   onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup',   onUp);
+  });
+})();
 
 // ─── Initialise ───────────────────────────────────────────────────────────────
 loadIndices();
 loadModelInfo();
 loadModels();
-loadCatalogue();
 providerSelect.addEventListener('change', onProviderChange);
 refreshCatalogue.addEventListener('click', loadCatalogue);
+openSettingsBtn.addEventListener('click', () => {
+  settingsModal.classList.add('open');
+  loadCatalogue();
+});
+closeSettingsBtn.addEventListener('click', () => settingsModal.classList.remove('open'));
+settingsModal.addEventListener('click', (e) => {
+  if (e.target === settingsModal) settingsModal.classList.remove('open');
+});
 
 maxResultsInput.addEventListener('input', () => {
   maxResultsVal.textContent = maxResultsInput.value;
@@ -42,7 +82,7 @@ maxResultsInput.addEventListener('input', () => {
 
 allResultsCb.addEventListener('change', () => {
   maxResultsInput.disabled = allResultsCb.checked;
-  maxResultsVal.textContent = allResultsCb.checked ? 'All' : maxResultsInput.value;
+  maxResultsVal.textContent = allResultsCb.checked ? '∞' : maxResultsInput.value;
 });
 
 // Auto-resize textarea
@@ -188,7 +228,8 @@ async function loadCatalogue() {
         <div class="catalogue-right">
           <span class="catalogue-size muted">${esc(m.size)}</span>
           ${m.installed
-            ? '<span class="catalogue-badge installed">✓</span>'
+            ? `<span class="catalogue-badge installed">✓</span>
+               <button class="btn-delete" data-model="${esc(m.name)}" title="Delete model">🗑</button>`
             : `<button class="btn-pull" data-model="${esc(m.name)}">↓</button>`}
         </div>
       </div>
@@ -196,6 +237,9 @@ async function loadCatalogue() {
 
     catalogueList.querySelectorAll('.btn-pull').forEach(btn => {
       btn.addEventListener('click', () => pullModel(btn.dataset.model, btn));
+    });
+    catalogueList.querySelectorAll('.btn-delete').forEach(btn => {
+      btn.addEventListener('click', () => deleteModel(btn.dataset.model, btn));
     });
   } catch (err) {
     catalogueList.innerHTML = `<span class="muted">Error: ${esc(String(err))}</span>`;
@@ -280,6 +324,23 @@ function stopThinkingTimer() {
   _statusBubble  = null;
 }
 
+async function deleteModel(modelName, btn) {
+  if (!confirm(`Delete ${modelName}? You can re-download it later.`)) return;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const resp = await fetch(`/api/models/${encodeURIComponent(modelName)}`, { method: 'DELETE' });
+    const data = await resp.json();
+    if (data.error) { alert(`Error: ${data.error}`); btn.disabled = false; btn.textContent = '🗑'; return; }
+    await loadCatalogue();
+    await loadModels();
+  } catch (err) {
+    alert(`Error: ${err}`);
+    btn.disabled = false;
+    btn.textContent = '🗑';
+  }
+}
+
 // ─── Chat ─────────────────────────────────────────────────────────────────────
 async function handleSubmit(e) {
   e.preventDefault();
@@ -291,8 +352,10 @@ async function handleSubmit(e) {
   const model      = getSelectedModel();
   const provider   = getSelectedProvider();
 
+  const conciseSuffix = conciseModeCb.checked ? '\n\n[Be concise — answer in 3 to 5 sentences maximum.]' : '';
+
   appendMessage('user', query);
-  state.conversationHistory.push({ role: 'user', content: query });
+  state.conversationHistory.push({ role: 'user', content: query + conciseSuffix });
   queryInput.value = '';
   queryInput.style.height = 'auto';
 
@@ -300,6 +363,22 @@ async function handleSubmit(e) {
   const contextMsg = document.createElement('div');
   contextMsg.className = 'msg context-msg';
   contextMsg.hidden = true;
+  messagesEl.appendChild(contextMsg);
+
+  // Generated query — collapsible panel, open by default
+  const queryBlock = document.createElement('details');
+  queryBlock.className = 'query-block';
+  queryBlock.open = false;
+  queryBlock.hidden = true;
+  const querySummary = document.createElement('summary');
+  querySummary.textContent = 'ES query';
+  const queryCode = document.createElement('pre');
+  queryCode.className = 'query-code';
+  queryBlock.appendChild(querySummary);
+  queryBlock.appendChild(queryCode);
+  contextMsg.appendChild(queryBlock);
+
+  // Records — collapsed by default
   const contextDetails = document.createElement('details');
   contextDetails.className = 'think-block context-block';
   const contextSummary = document.createElement('summary');
@@ -308,7 +387,6 @@ async function handleSubmit(e) {
   contextBody.className = 'think-body';
   contextDetails.appendChild(contextBody);
   contextMsg.appendChild(contextDetails);
-  messagesEl.appendChild(contextMsg);
 
   // Assistant message wrapper
   const msgEl = document.createElement('div');
@@ -371,7 +449,9 @@ async function handleSubmit(e) {
   }
 
   setStreaming(true);
-  startThinkingTimer(statusBubble, 'Sending request…');
+  state.abortController = new AbortController();
+  stopBtn.addEventListener('click', () => state.abortController.abort(), { once: true });
+  startThinkingTimer(statusBubble, '[*] sending request…');
   scrollToBottom();
 
   let hasContent  = false;
@@ -380,14 +460,16 @@ async function handleSubmit(e) {
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST',
+      signal: state.abortController.signal,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        query,
+        query: query + conciseSuffix,
         indices,
         max_results: maxResults,
         conversation_history: state.conversationHistory.slice(-20),
         model,
         provider,
+        smart_query: smartQueryCb.checked,
       }),
     });
 
@@ -429,13 +511,33 @@ async function handleSubmit(e) {
             _updateThinking();
           }
 
-          if (chunk.context) {
-            const n = chunk.context.length;
-            contextSummary.textContent = `${n} record${n === 1 ? '' : 's'} sent to LLM`;
-            contextBody.textContent = chunk.context
-              .map((e, i) => `[${i + 1}] ${JSON.stringify(e, null, 2)}`)
-              .join('\n\n');
+          if (chunk.generated_query) {
+            queryCode.textContent = JSON.stringify(chunk.generated_query, null, 2);
+            queryBlock.hidden = false;
             contextMsg.hidden = false;
+            scrollToBottom();
+          }
+
+          if (chunk.query_warning) {
+            const warn = document.createElement('div');
+            warn.className = 'query-warning';
+            warn.textContent = chunk.query_warning;
+            contextMsg.appendChild(warn);
+            contextMsg.hidden = false;
+            scrollToBottom();
+          }
+
+          if (chunk.context !== undefined) {
+            const n = chunk.context.length;
+            contextMsg.hidden = false;
+            if (n > 0) {
+              contextSummary.textContent = `${n} record${n === 1 ? '' : 's'} sent to LLM`;
+              contextBody.textContent = chunk.context
+                .map((e, i) => `[${i + 1}] ${JSON.stringify(e, null, 2)}`)
+                .join('\n\n');
+            } else {
+              contextSummary.textContent = 'No records found — LLM will respond without data context';
+            }
             scrollToBottom();
           }
 
@@ -475,7 +577,11 @@ async function handleSubmit(e) {
     stopThinkingTimer();
     stopGenStats(null);
     assistantBubble.classList.remove('cursor');
-    appendMessage('error', String(err));
+    if (err.name !== 'AbortError') {
+      appendMessage('error', String(err));
+    } else if (!hasContent) {
+      statusBubble.remove();
+    }
   } finally {
     stopThinkingTimer();
     clearInterval(statsTimer);
@@ -502,28 +608,33 @@ function scrollToBottom() {
 }
 
 function setStreaming(val) {
-  state.streaming    = val;
-  sendBtn.disabled   = val;
+  state.streaming     = val;
+  sendBtn.hidden      = val;
+  sendBtn.disabled    = val;
+  stopBtn.hidden      = !val;
   queryInput.disabled = val;
 }
 
 function clearChat() {
   state.conversationHistory = [];
   messagesEl.innerHTML = '';
-  appendMessage('assistant', 'Chat cleared. Ready for your next query.');
+  appendMessage('assistant', 'session cleared.');
 }
 
 function formatStatus(chunk) {
   if (chunk.status === 'searching') {
     const n = chunk.indices;
-    return `Searching ${n === 0 ? 'all' : n} ${n === 1 ? 'index' : 'indices'}…`;
+    return `[*] searching ${n === 0 ? 'all' : n} ${n === 1 ? 'index' : 'indices'}…`;
+  }
+  if (chunk.status === 'generating_query') {
+    return '[*] generating es query…';
   }
   if (chunk.status === 'found') {
     return chunk.count > 0
-      ? `Found ${chunk.count} event${chunk.count === 1 ? '' : 's'} — generating response…`
-      : 'No matching events — generating response…';
+      ? `[*] found ${chunk.count} event${chunk.count === 1 ? '' : 's'} — analysing…`
+      : '[*] no matching events — analysing…';
   }
-  return 'Working…';
+  return '[*] working…';
 }
 
 function esc(str) {

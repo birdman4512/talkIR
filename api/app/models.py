@@ -9,6 +9,7 @@ class ChatRequest(BaseModel):
     conversation_history: list[dict] = Field(default_factory=list)
     model: Optional[str] = None
     provider: str = "ollama"  # ollama | claude | openai
+    smart_query: bool = False
 
 
 class IndexInfo(BaseModel):

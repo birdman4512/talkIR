@@ -48,6 +48,22 @@ class PullRequest(BaseModel):
     model: str
 
 
+@router.delete("/models/{model:path}")
+async def delete_model(model: str):
+    """Delete a model from Ollama."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.delete(
+                f"{settings.ollama_host}/api/delete",
+                json={"name": model},
+            )
+            if resp.status_code not in (200, 404):
+                return {"error": f"Ollama returned {resp.status_code}"}
+            return {"deleted": model}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 @router.post("/models/pull")
 async def pull_model(req: PullRequest):
     """Stream Ollama pull progress as SSE."""
