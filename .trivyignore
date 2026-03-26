@@ -25,3 +25,31 @@ CVE-2026-2006
 CVE-2025-15467
 CVE-2025-69419
 CVE-2025-69421
+
+# Go stdlib CVEs embedded in /usr/bin/ollama (compiled with Go 1.24.1).
+# These require a newer ollama release built with Go 1.24.13+.
+# v0.18.3 is the latest release as of 2026-03-26 — review on next ollama upgrade.
+
+# crypto/tls — Unexpected session resumption
+CVE-2025-68121
+
+# crypto/x509 — ExtKeyUsageAny disables policy validation
+CVE-2025-22874
+
+# database/sql — Postgres scan race condition
+CVE-2025-47907
+
+# archive/tar — Unbounded allocation parsing GNU sparse map
+CVE-2025-58183
+
+# net/url — Memory exhaustion in query parameter parsing
+CVE-2025-61726
+
+# archive/zip — Excessive CPU consumption building archive index
+CVE-2025-61728
+
+# crypto/x509 — DoS via excessive resource consumption
+CVE-2025-61729
+
+# net/url — Incorrect parsing of IPv6 host literals
+CVE-2026-25679
