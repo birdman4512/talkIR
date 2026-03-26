@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .es_client import close_es_client
-from .routes import chat, indices, models
+from .auth import require_auth
+from .routes import auth, chat, indices, models
 
 
 @asynccontextmanager
@@ -28,6 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router, prefix="/api")
 app.include_router(indices.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(models.router, prefix="/api")
@@ -39,5 +41,5 @@ async def health():
 
 
 @app.get("/api/info")
-async def info():
+async def info(_: dict = Depends(require_auth)):
     return {"model": settings.ollama_model}

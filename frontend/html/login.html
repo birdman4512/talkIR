@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TalkIR — Login</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="login-body">
+  <div class="login-shell">
+    <div class="login-panel">
+      <div class="login-header">
+        <span class="logo">&gt;_ TalkIR</span>
+        <span class="logo-sub">security log intelligence</span>
+      </div>
+
+      <form id="loginForm" class="login-form" autocomplete="off">
+        <div class="login-field">
+          <label class="muted login-label">&gt; username</label>
+          <input type="text" id="username" class="login-input" autocomplete="username" required />
+        </div>
+        <div class="login-field">
+          <label class="muted login-label">&gt; password</label>
+          <input type="password" id="password" class="login-input" autocomplete="current-password" required />
+        </div>
+        <label class="check-label" style="margin-top:12px">
+          <input type="checkbox" id="rememberMe" />
+          remember me <span class="muted">(30 days)</span>
+        </label>
+        <div id="loginError" class="login-error" hidden></div>
+        <button type="submit" id="loginBtn" class="btn-login">[ authenticate ]</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    'use strict';
+    // Already logged in? Skip to app.
+    fetch('/api/auth/me').then(r => { if (r.ok) location.replace('/'); });
+
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn    = document.getElementById('loginBtn');
+      const errEl  = document.getElementById('loginError');
+      btn.disabled = true;
+      btn.textContent = '[ authenticating… ]';
+      errEl.hidden = true;
+
+      try {
+        const resp = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value,
+            password: document.getElementById('password').value,
+            remember: document.getElementById('rememberMe').checked,
+          }),
+        });
+
+        if (resp.ok) {
+          location.replace('/');
+        } else {
+          const data = await resp.json().catch(() => ({}));
+          errEl.textContent = '[!] ' + (data.detail || 'Authentication failed');
+          errEl.hidden = false;
+          btn.disabled = false;
+          btn.textContent = '[ authenticate ]';
+        }
+      } catch (err) {
+        errEl.textContent = '[!] Network error — is the server running?';
+        errEl.hidden = false;
+        btn.disabled = false;
+        btn.textContent = '[ authenticate ]';
+      }
+    });
+  </script>
+</body>
+</html>

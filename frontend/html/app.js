@@ -61,7 +61,24 @@ const stopBtn          = document.getElementById('stopBtn');
   });
 })();
 
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+const authUserEl = document.getElementById('authUser');
+const logoutBtn  = document.getElementById('logoutBtn');
+
+async function checkAuth() {
+  const resp = await fetch('/api/auth/me');
+  if (!resp.ok) { location.replace('/login.html'); return; }
+  const data = await resp.json();
+  authUserEl.textContent = data.username;
+}
+
+logoutBtn.addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  location.replace('/login.html');
+});
+
 // ─── Initialise ───────────────────────────────────────────────────────────────
+checkAuth();
 loadIndices();
 loadModelInfo();
 loadModels();
