@@ -419,7 +419,9 @@ async function handleSubmit(e) {
   const thinkDetails = document.createElement('details');
   thinkDetails.className = 'think-block';
   thinkDetails.hidden = true;
-  thinkDetails.innerHTML = '<summary>Reasoning</summary>';
+  const thinkSummary = document.createElement('summary');
+  thinkSummary.textContent = '// thinking...';
+  thinkDetails.appendChild(thinkSummary);
   const thinkBody = document.createElement('div');
   thinkBody.className = 'think-body';
   thinkDetails.appendChild(thinkBody);
@@ -437,9 +439,12 @@ async function handleSubmit(e) {
   liveStats.hidden = true;
   msgEl.appendChild(liveStats);
 
-  let tokenCount  = 0;
-  let genStart    = 0;
-  let statsTimer  = null;
+  let tokenCount   = 0;
+  let genStart     = 0;
+  let statsTimer   = null;
+  let thinkStart   = 0;
+  let thinkTimer   = null;
+  let thinkChars   = 0;
 
   function startGenStats() {
     genStart = Date.now();
@@ -559,8 +564,19 @@ async function handleSubmit(e) {
           }
 
           if (chunk.thinking) {
-            thinkDetails.hidden = false;
+            if (thinkDetails.hidden) {
+              thinkDetails.hidden = false;
+              thinkDetails.open = true;
+              thinkDetails.classList.add('active');
+              thinkStart = Date.now();
+              thinkTimer = setInterval(() => {
+                const s = ((Date.now() - thinkStart) / 1000).toFixed(1);
+                thinkSummary.textContent = `// thinking... (${s}s)`;
+              }, 100);
+            }
+            thinkChars += chunk.thinking.length;
             thinkBody.textContent += chunk.thinking;
+            thinkBody.scrollTop = thinkBody.scrollHeight;
             scrollToBottom();
           }
 
@@ -571,6 +587,15 @@ async function handleSubmit(e) {
               statusBubble.hidden = true;
               assistantBubble.hidden = false;
               startGenStats();
+              // Seal the thinking block
+              if (!thinkDetails.hidden) {
+                clearInterval(thinkTimer);
+                thinkTimer = null;
+                thinkDetails.classList.remove('active');
+                thinkDetails.open = false;
+                const s = ((Date.now() - thinkStart) / 1000).toFixed(1);
+                thinkSummary.textContent = `// reasoning (${s}s · ${thinkChars.toLocaleString()} chars)`;
+              }
             }
             if (chunk.content) {
               tokenCount++;
@@ -602,6 +627,7 @@ async function handleSubmit(e) {
   } finally {
     stopThinkingTimer();
     clearInterval(statsTimer);
+    clearInterval(thinkTimer);
     setStreaming(false);
   }
 }
