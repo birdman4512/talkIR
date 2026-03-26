@@ -46,8 +46,8 @@ async def _es_auth_and_indices(username: str, password: str) -> list[str]:
         raise
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Elasticsearch timed out")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Auth error: {exc}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Authentication service unavailable")
 
 
 @router.post("/auth/login")

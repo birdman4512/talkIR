@@ -1,7 +1,6 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .es_client import close_es_client
@@ -11,6 +10,10 @@ from .routes import auth, chat, indices, models
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if len(settings.jwt_secret) < 32:
+        raise RuntimeError(
+            "JWT_SECRET must be at least 32 characters — set it in .env"
+        )
     yield
     await close_es_client()
 
@@ -20,13 +23,6 @@ app = FastAPI(
     description="Chat with your security logs via Elasticsearch + LLM",
     version="1.0.0",
     lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
 )
 
 app.include_router(auth.router, prefix="/api")

@@ -118,7 +118,7 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
 
     if provider == "claude":
         if not settings.anthropic_api_key:
-            return ""
+            raise ValueError("ANTHROPIC_API_KEY is not configured in .env")
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
@@ -134,7 +134,7 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
 
     elif provider == "openai":
         if not settings.openai_api_key:
-            return ""
+            raise ValueError("OPENAI_API_KEY is not configured in .env")
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -482,7 +482,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
         context_block = _build_context_block(events)
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if req.conversation_history:
-            messages.extend(req.conversation_history[-20:])
+            messages.extend(m.model_dump() for m in req.conversation_history[-20:])
         messages.append({"role": "user", "content": req.query + context_block})
 
         try:
