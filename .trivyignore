@@ -1,0 +1,27 @@
+# CVEs in fluent/fluent-bit:3.2 base image packages.
+# This image has no shell (/bin/sh absent), so apt-get cannot be run to upgrade
+# packages. These are acknowledged base-image findings outside our control.
+# Review when upgrading fluent-bit to a newer major version.
+
+# libc6
+CVE-2025-4802
+
+# libgnutls30
+CVE-2025-32988
+CVE-2025-32990
+
+# liblzma5
+CVE-2025-31115
+
+# libpq5
+CVE-2025-12818
+CVE-2025-8714
+CVE-2025-8715
+CVE-2026-2004
+CVE-2026-2005
+CVE-2026-2006
+
+# libssl3
+CVE-2025-15467
+CVE-2025-69419
+CVE-2025-69421

@@ -103,6 +103,7 @@ jobs:
           exit-code: "1"
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          trivyignores: .trivyignore
 
   # ── 6. Secret scanning ───────────────────────────────────────────────────────
   secret-scan:
