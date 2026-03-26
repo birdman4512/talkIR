@@ -40,13 +40,21 @@ Rules:
 - No join queries (has_child, has_parent, nested) — documents are flat.
 - The "query" value must contain EXACTLY ONE top-level key (e.g. "bool", "match", "term", "exists"). NEVER put two query types as sibling keys.
 - To combine conditions use bool.must / bool.should / bool.filter arrays.
-- For "list/show/summarise/relationship" queries: use match_all + _source with relevant fields.
+- For "list/show/relationship" queries: use match_all + _source with relevant fields.
+- For "count/frequency/top N/how many/how often" queries: use aggregations (aggs) and set size:0.
 - Do not invent specific values unless the user names them.
+
+For questions requiring different event types (e.g. lateral movement needs auth events AND process events), return multiple queries:
+{"queries":[{"query":{...},"size":N},{"query":{...},"aggs":{...},"size":0}]}
+Use at most 3 queries. Prefer a single query unless multiple are clearly needed.
 
 Fields ($indices): $fields
 
 Example — "users signing in from 1.2.3.4":
-{"query":{"bool":{"must":[{"term":{"IpAddress":"1.2.3.4"}},{"exists":{"field":"UserName"}}]}},"_source":["UserName","IpAddress","@timestamp"],"size":20}""")
+{"query":{"bool":{"must":[{"term":{"IpAddress":"1.2.3.4"}},{"exists":{"field":"UserName"}}]}},"_source":["UserName","IpAddress","@timestamp"],"size":20}
+
+Example — "how often did each user sign in":
+{"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50}}},"size":0}""")
 
 
 def _collect_fields(props: dict, prefix: str, out: list):
@@ -85,6 +93,16 @@ def _sanitize_query_body(body: dict) -> dict:
         # Wrap all sibling clauses into bool.must
         body["query"] = {"bool": {"must": [{k: v} for k, v in q.items()]}}
     return body
+
+
+def _extract_hits(result: dict) -> list[dict]:
+    """Extract records from an ES response — handles both hits and aggregation buckets."""
+    rows = [h["_source"] for h in result.get("hits", {}).get("hits", [])]
+    for agg_name, agg_data in result.get("aggregations", {}).items():
+        for bucket in agg_data.get("buckets", []):
+            key = bucket.get("key_as_string") or bucket.get("key")
+            rows.append({agg_name: key, "count": bucket.get("doc_count", 0)})
+    return rows
 
 
 def _extract_json(text: str) -> dict | None:
@@ -152,6 +170,7 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
                     "model": model,
                     "messages": [{"role": "system", "content": system}] + messages,
                     "stream": False,
+                    "think": True,
                 },
             )
             data = resp.json()
@@ -160,12 +179,20 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
             return data.get("message", {}).get("content", "")
 
 
+async def _run_query(es, target: str, query_body: dict, size_cap: int) -> list[dict]:
+    """Run a single ES query body and return extracted records."""
+    query_body["size"] = min(query_body.get("size", size_cap), size_cap)
+    query_body = _sanitize_query_body(query_body)
+    result = await es.search(index=target, body=query_body)
+    return _extract_hits(result)
+
+
 async def _smart_search(
     provider: str, model: str, indices: list[str], query: str, max_results: int
-) -> tuple[list[dict], dict | None, str | None]:
+) -> tuple[list[dict], dict | list | None, str | None]:
     """
-    Use the LLM to generate an ES query, run it, and return (events, query_body, fallback_reason).
-    fallback_reason is set if we fell back to keyword search.
+    Use the LLM to generate one or more ES queries, run them, and return
+    (events, query_body_or_list, fallback_reason).
     """
     es = get_es_client()
 
@@ -178,26 +205,60 @@ async def _smart_search(
     )
 
     raw = await _llm_complete(provider, model, system, query)
-    query_body = _extract_json(raw)
+    parsed = _extract_json(raw)
 
-    if not query_body or "query" not in query_body:
-        # Fall back to keyword search
+    if not parsed or ("query" not in parsed and "queries" not in parsed):
         events = await _keyword_search(indices, query, max_results)
         detail = raw[:500] if raw.strip() else "(model returned no output — possible OOM or context overflow)"
         return events, None, f"LLM did not return valid query JSON — fell back to keyword search.\n\nLLM output:\n{detail}"
 
-    # Enforce size cap and fix common structural mistakes
-    query_body["size"] = min(query_body.get("size", max_results), max_results)
-    query_body = _sanitize_query_body(query_body)
+    target = ",".join(indices[:20]) if indices else "_all"
 
-    try:
-        target = ",".join(indices[:20]) if indices else "_all"
-        result = await es.search(index=target, body=query_body)
-        events = [hit["_source"] for hit in result["hits"]["hits"]]
-        return events, query_body, None
-    except Exception as exc:
-        events = await _keyword_search(indices, query, max_results)
-        return events, query_body, f"Generated query failed ({exc}) — fell back to keyword search."
+    if "queries" in parsed:
+        # ── Multiple queries ────────────────────────────────────────────────────
+        raw_queries = parsed["queries"]
+        if not isinstance(raw_queries, list) or not raw_queries:
+            events = await _keyword_search(indices, query, max_results)
+            return events, None, "LLM returned empty queries list — fell back to keyword search."
+
+        per_query = max(1, max_results // min(len(raw_queries), 3))
+        all_events: list[dict] = []
+        valid_bodies: list[dict] = []
+        errors: list[str] = []
+
+        for qb in raw_queries[:3]:
+            if not isinstance(qb, dict) or "query" not in qb:
+                continue
+            try:
+                all_events.extend(await _run_query(es, target, qb, per_query))
+                valid_bodies.append(qb)
+            except Exception as exc:
+                errors.append(str(exc))
+
+        if not valid_bodies:
+            events = await _keyword_search(indices, query, max_results)
+            return events, None, f"All generated queries failed — fell back to keyword search. {'; '.join(errors)}"
+
+        # Deduplicate preserving insertion order
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for e in all_events:
+            k = json.dumps(e, sort_keys=True)
+            if k not in seen:
+                seen.add(k)
+                deduped.append(e)
+
+        fallback = f"Some queries failed: {'; '.join(errors)}" if errors else None
+        return deduped[:max_results], valid_bodies, fallback
+
+    else:
+        # ── Single query ────────────────────────────────────────────────────────
+        try:
+            events = await _run_query(es, target, parsed, max_results)
+            return events, parsed, None
+        except Exception as exc:
+            events = await _keyword_search(indices, query, max_results)
+            return events, parsed, f"Generated query failed ({exc}) — fell back to keyword search."
 
 
 async def _keyword_search(indices: list[str], query: str, max_results: int) -> list[dict]:
@@ -230,7 +291,7 @@ async def _keyword_search(indices: list[str], query: str, max_results: int) -> l
                 "sort": [{"_score": "desc"}],
             },
         )
-        return [hit["_source"] for hit in result["hits"]["hits"]]
+        return _extract_hits(result)
     except Exception:
         return []
 
@@ -256,7 +317,7 @@ async def _stream_ollama(model: str, messages: list[dict]):
         async with client.stream(
             "POST",
             f"{settings.ollama_host}/api/chat",
-            json={"model": model, "messages": messages, "stream": True},
+            json={"model": model, "messages": messages, "stream": True, "think": True},
         ) as response:
             if response.status_code != 200:
                 body = await response.aread()
@@ -277,6 +338,11 @@ async def _stream_ollama(model: str, messages: list[dict]):
                 if "error" in chunk:
                     yield ("error", f"Ollama: {chunk['error']}", False, {})
                     return
+
+                # Native thinking field — Ollama 0.6+ with think: true
+                native_think = chunk.get("message", {}).get("thinking", "")
+                if native_think:
+                    yield ("thinking", native_think, False, {})
 
                 content = chunk.get("message", {}).get("content", "")
                 done = chunk.get("done", False)

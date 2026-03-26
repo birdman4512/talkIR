@@ -381,18 +381,7 @@ async function handleSubmit(e) {
   contextMsg.hidden = true;
   messagesEl.appendChild(contextMsg);
 
-  // Generated query — collapsible panel, open by default
-  const queryBlock = document.createElement('details');
-  queryBlock.className = 'query-block';
-  queryBlock.open = false;
-  queryBlock.hidden = true;
-  const querySummary = document.createElement('summary');
-  querySummary.textContent = 'ES query';
-  const queryCode = document.createElement('pre');
-  queryCode.className = 'query-code';
-  queryBlock.appendChild(querySummary);
-  queryBlock.appendChild(queryCode);
-  contextMsg.appendChild(queryBlock);
+  // Query blocks are created dynamically when generated_query arrives
 
   // Records — collapsed by default
   const contextDetails = document.createElement('details');
@@ -531,8 +520,23 @@ async function handleSubmit(e) {
           }
 
           if (chunk.generated_query) {
-            queryCode.textContent = JSON.stringify(chunk.generated_query, null, 2);
-            queryBlock.hidden = false;
+            const queries = Array.isArray(chunk.generated_query)
+              ? chunk.generated_query
+              : [chunk.generated_query];
+            queries.forEach((q, i) => {
+              const qBlock = document.createElement('details');
+              qBlock.className = 'query-block';
+              const qSummary = document.createElement('summary');
+              qSummary.textContent = queries.length > 1
+                ? `ES query ${i + 1}/${queries.length}`
+                : 'ES query';
+              const qCode = document.createElement('pre');
+              qCode.className = 'query-code';
+              qCode.textContent = JSON.stringify(q, null, 2);
+              qBlock.appendChild(qSummary);
+              qBlock.appendChild(qCode);
+              contextMsg.appendChild(qBlock);
+            });
             contextMsg.hidden = false;
             scrollToBottom();
           }
