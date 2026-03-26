@@ -1,7 +1,8 @@
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from ..auth import require_auth
 from ..config import settings
 
 router = APIRouter()
@@ -28,14 +29,14 @@ async def _get_installed() -> set[str]:
 
 
 @router.get("/models")
-async def list_models():
+async def list_models(_: dict = Depends(require_auth)):
     """Return names of installed models."""
     installed = await _get_installed()
     return sorted(installed)
 
 
 @router.get("/models/catalogue")
-async def model_catalogue():
+async def model_catalogue(_: dict = Depends(require_auth)):
     """Return curated model list with installed status."""
     installed = await _get_installed()
     return [
@@ -49,7 +50,7 @@ class PullRequest(BaseModel):
 
 
 @router.delete("/models/{model:path}")
-async def delete_model(model: str):
+async def delete_model(model: str, _: dict = Depends(require_auth)):
     """Delete a model from Ollama."""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -65,7 +66,7 @@ async def delete_model(model: str):
 
 
 @router.post("/models/pull")
-async def pull_model(req: PullRequest):
+async def pull_model(req: PullRequest, _: dict = Depends(require_auth)):
     """Stream Ollama pull progress as SSE."""
     async def stream():
         try:

@@ -2,9 +2,10 @@ import json
 import re
 import httpx
 from string import Template
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
+from ..auth import require_auth
 from ..es_client import get_es_client
 from ..models import ChatRequest
 from ..config import settings
@@ -427,9 +428,15 @@ async def _stream_openai(model: str, messages: list[dict]):
 
 
 @router.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     provider = req.provider or "ollama"
     model    = req.model or settings.ollama_model
+
+    # Restrict requested indices to what this user's JWT allows
+    allowed = user.get("indices")
+    if allowed is not None:
+        allowed_set = set(allowed)
+        req = req.model_copy(update={"indices": [i for i in req.indices if i in allowed_set]})
 
     async def stream_response():
         # ── Phase 1: resolve indices ────────────────────────────────────────────

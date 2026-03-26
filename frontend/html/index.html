@@ -78,7 +78,11 @@
     <main class="chat-pane">
       <header class="chat-header">
         <span class="chat-header-prompt"><span class="accent">talkir</span>@security:~$</span>
-        <span id="modelBadge" class="badge">model: …</span>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span id="authUser" class="auth-user"></span>
+          <span id="modelBadge" class="badge">model: …</span>
+          <button class="btn-logout" id="logoutBtn" title="Log out">[ logout ]</button>
+        </div>
       </header>
 
       <div id="messages" class="messages">

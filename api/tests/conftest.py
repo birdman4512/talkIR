@@ -5,6 +5,15 @@ from httpx import AsyncClient, ASGITransport
 
 from app.main import app
 from app import es_client as es_client_module
+from app.auth import require_auth
+
+
+@pytest.fixture(autouse=True)
+def mock_auth():
+    """Bypass authentication for all tests — simulates a logged-in superuser."""
+    app.dependency_overrides[require_auth] = lambda: {"sub": "testuser", "indices": None}
+    yield
+    app.dependency_overrides.clear()
 
 
 @pytest_asyncio.fixture

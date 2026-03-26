@@ -1,5 +1,6 @@
 import re
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from ..auth import require_auth
 from ..es_client import get_es_client
 from ..models import IndexInfo
 
@@ -43,13 +44,19 @@ def _group_indices(raw: list[dict]) -> list[IndexInfo]:
 
 
 @router.get("/indices", response_model=list[IndexInfo])
-async def list_indices():
+async def list_indices(user: dict = Depends(require_auth)):
     try:
         es = get_es_client()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Elasticsearch error: {exc}") from exc
     try:
         resp = await es.cat.indices(format="json", h="index,docs.count,store.size")
-        return _group_indices(resp)
+        all_indices = _group_indices(resp)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Elasticsearch error: {exc}") from exc
+
+    allowed = user.get("indices")
+    if allowed is None:
+        return all_indices
+    allowed_set = set(allowed)
+    return [idx for idx in all_indices if idx.name in allowed_set]
