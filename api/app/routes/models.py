@@ -1,11 +1,15 @@
+import re
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ..auth import require_auth
 from ..config import settings
 
 router = APIRouter()
+
+# Matches valid Ollama model names, e.g. "llama3.2:3b", "deepseek-r1:7b"
+_MODEL_RE = re.compile(r'^[\w][\w.\-:/]{0,99}$')
 
 CATALOGUE = [
     {"name": "llama3.2:3b",      "size": "2.0 GB", "desc": "Fast, basic analysis"},
@@ -46,12 +50,14 @@ async def model_catalogue(_: dict = Depends(require_auth)):
 
 
 class PullRequest(BaseModel):
-    model: str
+    model: str = Field(..., pattern=r'^[\w][\w.\-:/]{0,99}$')
 
 
 @router.delete("/models/{model:path}")
 async def delete_model(model: str, _: dict = Depends(require_auth)):
     """Delete a model from Ollama."""
+    if not _MODEL_RE.match(model):
+        raise HTTPException(status_code=400, detail="Invalid model name")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.delete(
@@ -59,10 +65,12 @@ async def delete_model(model: str, _: dict = Depends(require_auth)):
                 json={"name": model},
             )
             if resp.status_code not in (200, 404):
-                return {"error": f"Ollama returned {resp.status_code}"}
+                raise HTTPException(status_code=502, detail=f"Ollama returned {resp.status_code}")
             return {"deleted": model}
+    except HTTPException:
+        raise
     except Exception as exc:
-        return {"error": str(exc)}
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @router.post("/models/pull")

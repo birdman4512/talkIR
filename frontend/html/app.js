@@ -305,8 +305,7 @@ async function pullModel(modelName, btn) {
     }
 
     // Refresh catalogue and model dropdown after successful pull
-    await loadCatalogue();
-    await loadModels();
+    await Promise.all([loadCatalogue(), loadModels()]);
   } catch (err) {
     progress.textContent = `Error: ${err}`;
   }
@@ -439,7 +438,6 @@ async function handleSubmit(e) {
   liveStats.hidden = true;
   msgEl.appendChild(liveStats);
 
-  let tokenCount   = 0;
   let genStart     = 0;
   let statsTimer   = null;
   let thinkStart   = 0;
@@ -451,8 +449,7 @@ async function handleSubmit(e) {
     liveStats.hidden = false;
     statsTimer = setInterval(() => {
       const secs = ((Date.now() - genStart) / 1000).toFixed(1);
-      const rate = genStart ? (tokenCount / ((Date.now() - genStart) / 1000)).toFixed(1) : 0;
-      liveStats.textContent = `${tokenCount} tokens · ${rate} tok/s · ${secs}s`;
+      liveStats.textContent = `${secs}s elapsed`;
     }, 250);
   }
 
@@ -598,7 +595,6 @@ async function handleSubmit(e) {
               }
             }
             if (chunk.content) {
-              tokenCount++;
               fullReply += chunk.content;
               assistantBubble.textContent = fullReply;
             }

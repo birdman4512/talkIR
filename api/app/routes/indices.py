@@ -38,7 +38,7 @@ def _group_indices(raw: list[dict]) -> list[IndexInfo]:
         groups[pattern]["doc_count"] += doc_count
 
     return sorted(
-        [IndexInfo(name=g["name"], doc_count=g["doc_count"], store_size="") for g in groups.values()],
+        [IndexInfo(name=g["name"], doc_count=g["doc_count"]) for g in groups.values()],
         key=lambda x: x.name,
     )
 
@@ -50,7 +50,7 @@ async def list_indices(user: dict = Depends(require_auth)):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Elasticsearch error: {exc}") from exc
     try:
-        resp = await es.cat.indices(format="json", h="index,docs.count,store.size")
+        resp = await es.cat.indices(format="json", h="index,docs.count")
         all_indices = _group_indices(resp)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Elasticsearch error: {exc}") from exc
