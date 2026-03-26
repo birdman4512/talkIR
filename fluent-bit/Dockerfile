@@ -2,6 +2,8 @@ FROM fluent/fluent-bit:3.2
 
 # Upgrade base packages to pick up patched versions of libssl3, libc6,
 # libgnutls30, liblzma5, libpq5 (Trivy CRITICAL/HIGH findings).
+# DL3002: base image runs as root; this image requires root to read system logs.
+# hadolint ignore=DL3002
 USER root
 # hadolint ignore=DL3005,DL3008
 RUN apt-get update && \
