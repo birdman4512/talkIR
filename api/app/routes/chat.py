@@ -87,11 +87,15 @@ async def _get_mapping_fields(es, indices: list[str]) -> str:
 
 
 def _sanitize_query_body(body: dict) -> dict:
-    """Fix the common LLM mistake of putting multiple sibling keys inside 'query'."""
+    """Fix common LLM query mistakes."""
     q = body.get("query", {})
-    if isinstance(q, dict) and len(q) > 1:
-        # Wrap all sibling clauses into bool.must
-        body["query"] = {"bool": {"must": [{k: v} for k, v in q.items()]}}
+    if isinstance(q, dict):
+        if len(q) > 1:
+            # Multiple sibling keys — wrap in bool.must
+            body["query"] = {"bool": {"must": [{k: v} for k, v in q.items()]}}
+        elif "match_all" in q and q["match_all"]:
+            # match_all must be empty — LLM sometimes puts fields inside it
+            body["query"]["match_all"] = {}
     return body
 
 

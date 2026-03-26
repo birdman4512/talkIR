@@ -151,6 +151,7 @@ input[type=range]:disabled { opacity: 0.3; }
   text-align: center;
 }
 .btn-term:hover { border-color: var(--accent); color: var(--accent); }
+a.btn-term { text-decoration: none; display: flex; align-items: center; justify-content: center; }
 
 /* ─── Chat pane ───────────────────────────────────────────────────────────── */
 .chat-pane {
