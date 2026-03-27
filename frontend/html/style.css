@@ -20,6 +20,17 @@
 html, body               { height: 100%; overflow: hidden; }
 body                     { font-family: var(--font-mono); background: var(--bg); color: var(--text); font-size: 13px; }
 
+/* ─── Scrollbars ──────────────────────────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--dim) transparent;
+}
+*::-webkit-scrollbar       { width: 5px; height: 5px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 0; }
+*::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+*::-webkit-scrollbar-corner { background: transparent; }
+
 /* ─── Layout ──────────────────────────────────────────────────────────────── */
 .shell {
   display: grid;
