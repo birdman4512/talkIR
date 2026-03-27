@@ -141,8 +141,14 @@ def _collect_fields(props: dict, prefix: str, out: list[tuple[str, str]]):
             _collect_fields(data["properties"], full, out)
 
 
-async def _get_mapping_fields(es, indices: list[str]) -> str:
-    """Return a structured field list with type hints for the query-gen prompt."""
+async def _get_mapping_fields(
+    es, indices: list[str]
+) -> tuple[str, dict[str, str]]:
+    """Return (prompt_string, field_type_dict) from ES index mappings.
+
+    prompt_string — "FieldName (type), …" for the query-gen prompt (≤60 fields)
+    field_type_dict — {field_name: type_hint} for runtime query sanitisation
+    """
     try:
         target = ",".join(indices[:5]) if indices else "_all"
         mapping = await es.indices.get_mapping(index=target)
@@ -150,7 +156,6 @@ async def _get_mapping_fields(es, indices: list[str]) -> str:
         for idx_data in mapping.values():
             props = idx_data.get("mappings", {}).get("properties", {})
             _collect_fields(props, "", fields)
-        # Deduplicate by field name, preserving first occurrence
         seen: set[str] = set()
         unique: list[tuple[str, str]] = []
         for name, hint in fields:
@@ -158,11 +163,54 @@ async def _get_mapping_fields(es, indices: list[str]) -> str:
                 seen.add(name)
                 unique.append((name, hint))
         if not unique:
-            return "(unavailable)"
-        # Format: "FieldName (type)" — cap at 60 fields to stay within prompt budget
-        return ", ".join(f"{n} ({h})" for n, h in unique[:60])
+            return "(unavailable)", {}
+        field_types = dict(unique)
+        prompt_str = ", ".join(f"{n} ({h})" for n, h in unique[:60])
+        return prompt_str, field_types
     except Exception:
-        return "(unavailable)"
+        return "(unavailable)", {}
+
+
+def _fix_agg_fields(aggs: dict, field_types: dict[str, str]) -> None:
+    """Mutate aggs in-place: rewrite text+kw → field.keyword, remove pure text fields."""
+    for agg_name in list(aggs.keys()):
+        agg_def = aggs[agg_name]
+        if not isinstance(agg_def, dict):
+            continue
+
+        # terms aggregation
+        if "terms" in agg_def:
+            field = agg_def["terms"].get("field", "")
+            ftype = field_types.get(field, "")
+            if ftype == "text+kw":
+                agg_def["terms"]["field"] = field + ".keyword"
+            elif ftype == "text":
+                del aggs[agg_name]
+                continue
+
+        # composite aggregation sources
+        if "composite" in agg_def:
+            sources = agg_def["composite"].get("sources", [])
+            fixed = []
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                for src_name, src_def in src.items():
+                    if "terms" in src_def:
+                        field = src_def["terms"].get("field", "")
+                        ftype = field_types.get(field, "")
+                        if ftype == "text+kw":
+                            src_def["terms"]["field"] = field + ".keyword"
+                        elif ftype == "text":
+                            break  # skip this source entirely
+                else:
+                    fixed.append(src)
+            agg_def["composite"]["sources"] = fixed
+
+        # recurse into sub-aggs
+        sub = agg_def.get("aggs") or agg_def.get("aggregations")
+        if isinstance(sub, dict):
+            _fix_agg_fields(sub, field_types)
 
 
 _THINKING_MODEL_PATTERNS = ("deepseek", "r1", "qwq", "thinking")
@@ -460,7 +508,7 @@ async def _smart_search(
     es = get_es_client()
 
     index_str = ", ".join(indices) if indices else "all indices"
-    fields_str = await _get_mapping_fields(es, indices)
+    fields_str, field_types = await _get_mapping_fields(es, indices)
     system = QUERY_GEN_PROMPT.substitute(
         max_results=max_results,
         indices=index_str,
@@ -511,6 +559,10 @@ async def _smart_search(
             yield ("result", events, None, "No valid query objects in LLM response — fell back to keyword search.")
             return
 
+        # Fix text/text+kw fields in aggregations before running
+        for qb in valid_raw:
+            _fix_agg_fields(qb.get("aggs", qb.get("aggregations", {})), field_types)
+
         per_query = max(1, max_results // len(valid_raw))
         total = len(valid_raw)
         all_events: list[dict] = []
@@ -556,6 +608,7 @@ async def _smart_search(
 
     else:
         # ── Single query ────────────────────────────────────────────────────────
+        _fix_agg_fields(parsed.get("aggs", parsed.get("aggregations", {})), field_types)
         try:
             events = await _run_query(es, target, parsed, max_results)
             yield ("result", events, parsed, None)
