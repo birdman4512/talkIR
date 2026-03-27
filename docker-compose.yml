@@ -92,6 +92,8 @@ services:
         done
 
         echo "==> Setup complete."
+        # Stay alive so health check can pass (health check requires a running container)
+        sleep infinity
       '
     healthcheck:
       test: ["CMD-SHELL", "[ -f config/certs/certs.zip ]"]
@@ -133,7 +135,7 @@ services:
       - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
       - xpack.security.transport.ssl.verification_mode=certificate
       - xpack.license.self_generated.type=${LICENSE:-basic}
-    mem_limit: ${MEM_LIMIT:-1073741824}
+    mem_limit: ${ES_MEM_LIMIT:-536870912}
     healthcheck:
       test:
         - "CMD-SHELL"
@@ -174,7 +176,7 @@ services:
       - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
       - XPACK_REPORTING_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
       - SERVER_SSL_ENABLED=false       # HTTP on 5601 — add your own reverse proxy for HTTPS
-    mem_limit: ${MEM_LIMIT:-1073741824}
+    mem_limit: ${KIBANA_MEM_LIMIT:-402653184}
     healthcheck:
       test:
         - "CMD-SHELL"

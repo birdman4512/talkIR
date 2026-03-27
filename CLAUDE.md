@@ -77,7 +77,7 @@ The stack has six layers that talk to each other over the `internal` Docker netw
 
 ## Environment variables
 
-All configuration is in `.env` (copy from `.env.example`). The three passwords (`ELASTIC_PASSWORD`, `KIBANA_PASSWORD`, `KIBANA_ENCRYPTION_KEY`) must be changed before first run. `OLLAMA_MODEL` controls the LLM; `MEM_LIMIT` controls per-ES-node memory (bytes).
+All configuration is in `.env` (copy from `.env.example`). The three passwords (`ELASTIC_PASSWORD`, `KIBANA_PASSWORD`, `KIBANA_ENCRYPTION_KEY`) must be changed before first run. `OLLAMA_MODEL` controls the LLM; `ES_MEM_LIMIT` and `KIBANA_MEM_LIMIT` control per-container memory limits (bytes).
 
 ## File map for common tasks
 

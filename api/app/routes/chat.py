@@ -88,6 +88,7 @@ Rules:
 - When both a raw field (e.g. DestIP) and an ECS field (e.g. destination.ip) are available, prefer the ECS field — it has the correct type mapping.
 - bool.should without bool.must means OR — add "minimum_should_match":1 so at least one condition must match. Without it, should clauses are optional.
 - NEVER use match on (keyword) fields — use term or terms instead.
+- JSON syntax: the colon separating a key from its value is OUTSIDE the quoted string. Write "match_all": {} NOT "match_all:{}". The string "match_all:{}" is a string literal, not a query clause.
 
 Field type guide (use this to choose the right query clause):
 - (keyword)   → exact match with term/terms, use directly in aggs
@@ -259,6 +260,11 @@ def _fix_agg_fields(aggs: dict, field_types: dict[str, str]) -> None:
 
         # terms aggregation
         if "terms" in agg_def:
+            # LLMs sometimes put "size" as a sibling of "terms" inside the agg
+            # definition rather than inside "terms" — move it in.
+            # e.g. {"terms": {"field": "x"}, "size": 0} → {"terms": {"field": "x", "size": 50}}
+            if "size" in agg_def and isinstance(agg_def["size"], int):
+                agg_def["terms"].setdefault("size", agg_def.pop("size") or 50)
             field = agg_def["terms"].get("field", "")
             ftype = field_types.get(field, "")
             if ftype == "text+kw":
@@ -424,9 +430,10 @@ def _sanitize_query_body(body: dict) -> dict:
         for agg_key in ("aggs", "aggregations"):
             if agg_key in q:
                 body[agg_key] = q.pop(agg_key)
-        # size inside query — hoist to top level
-        if "size" in q:
-            body.setdefault("size", q.pop("size"))
+        # _source / size inside query — hoist to top level
+        for hoist in ("size", "_source"):
+            if hoist in q:
+                body.setdefault(hoist, q.pop(hoist))
         # After hoisting, if query is now empty replace with match_all
         if not q:
             body["query"] = {"match_all": {}}
@@ -643,6 +650,15 @@ def _fix_bare_keys(text: str) -> str:
     return re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r' "\1":', text)
 
 
+def _fix_merged_key_obj(text: str) -> str:
+    """Fix LLM mistake where key and empty-object value are merged into one string.
+
+    "match_all:{}"  →  "match_all": {}
+    "match_all: {}" →  "match_all": {}
+    """
+    return re.sub(r'"([A-Za-z_][\w.]*?):\s*\{\}"', r'"\1": {}', text)
+
+
 def _extract_json(text: str) -> dict | None:
     """Pull a JSON object out of freeform LLM output."""
     text = text.strip()
@@ -651,7 +667,7 @@ def _extract_json(text: str) -> dict | None:
     text = re.sub(r'//[^\n"]*', '', text)                   # // line comments
 
     def _try(s: str) -> dict | list | None:
-        for attempt in (s, _fix_bare_keys(s)):
+        for attempt in (s, _fix_bare_keys(s), _fix_merged_key_obj(s), _fix_merged_key_obj(_fix_bare_keys(s))):
             try:
                 return json.loads(attempt)
             except json.JSONDecodeError:
@@ -754,6 +770,7 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
             "model": model,
             "messages": [{"role": "system", "content": system}] + messages,
             "stream": False,
+            "options": {"num_ctx": 8192},  # cap KV cache to reduce memory pressure
         }
         if _supports_thinking(model):
             payload["think"] = True
@@ -776,6 +793,7 @@ async def _stream_query_gen_ollama(model: str, system: str, user: str):
             {"role": "user", "content": user},
         ],
         "stream": True,
+        "options": {"num_ctx": 8192},  # cap KV cache to reduce memory pressure
     }
     if _supports_thinking(model):
         payload["think"] = True

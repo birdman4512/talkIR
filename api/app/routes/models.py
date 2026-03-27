@@ -65,7 +65,7 @@ async def delete_model(model: str, _: dict = Depends(require_auth)):
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.delete(
                 f"{settings.ollama_host}/api/delete",
-                json={"name": model},
+                json={"model": model},
             )
             if resp.status_code not in (200, 404):
                 raise HTTPException(status_code=502, detail=f"Ollama returned {resp.status_code}")

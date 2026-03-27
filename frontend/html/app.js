@@ -437,13 +437,18 @@ async function deleteModel(modelName, btn) {
   try {
     const resp = await fetch(`/api/models/${encodeURIComponent(modelName)}`, { method: 'DELETE' });
     const data = await resp.json();
-    if (data.error) { alert(`Error: ${data.error}`); btn.disabled = false; btn.textContent = '🗑'; return; }
+    if (!resp.ok) {
+      alert(`Error: ${data.detail || data.error || `HTTP ${resp.status}`}`);
+      btn.disabled = false;
+      btn.textContent = '✕';
+      return;
+    }
     await loadCatalogue();
     await loadModels();
   } catch (err) {
     alert(`Error: ${err}`);
     btn.disabled = false;
-    btn.textContent = '🗑';
+    btn.textContent = '✕';
   }
 }
 
