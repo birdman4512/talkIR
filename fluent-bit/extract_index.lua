@@ -113,11 +113,9 @@ function set_index(tag, timestamp, record)
     record["velociraptor_artifact"] = artifact
 
     if host ~= "" then
-        record["host"]      = host
-        record["log_index"] = host .. "-" .. artifact
-    else
-        record["log_index"] = artifact
+        record["host"] = host
     end
+    record["log_index"] = artifact
 
     -- ── Timestamp normalisation ───────────────────────────────────────────────
     -- Try standard ISO fields first
