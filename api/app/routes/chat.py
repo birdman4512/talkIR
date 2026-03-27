@@ -144,6 +144,51 @@ def _collect_fields(props: dict, prefix: str, out: list[tuple[str, str]]):
             _collect_fields(data["properties"], full, out)
 
 
+# Field types where a sample value is worth showing in the prompt
+_SAMPLE_TYPES = {"ip", "keyword", "long", "integer", "text+kw"}
+# Skip values that are UUIDs, hashes, or SIDs — not helpful for the LLM
+import re as _re
+_SKIP_SAMPLE_RE = _re.compile(
+    r'^[0-9a-f]{32,}$'           # MD5/SHA hashes
+    r'|^[0-9a-f-]{36}$'          # UUIDs
+    r'|^S-1-\d'                   # Windows SIDs
+    r'|^\d{10,}$',                # epoch timestamps, record IDs
+    _re.IGNORECASE,
+)
+
+
+def _collect_sample_values(obj, prefix: str, out: dict[str, str], depth: int = 0) -> None:
+    """Recursively collect one representative sample value per field path."""
+    if depth > 4 or not isinstance(obj, dict):
+        return
+    for k, v in obj.items():
+        key = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            _collect_sample_values(v, key, out, depth + 1)
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            _collect_sample_values(v[0], key, out, depth + 1)
+        elif v is not None and key not in out:
+            s = str(v).strip()
+            if s and s not in ("null", "-", "", "true", "false") and not _SKIP_SAMPLE_RE.match(s):
+                out[key] = s[:60]
+
+
+async def _get_field_samples(es, indices: list[str]) -> dict[str, str]:
+    """Return {field_path: example_value} from a small sample of documents."""
+    try:
+        target = ",".join(indices[:5]) if indices else "_all"
+        result = await es.search(
+            index=target,
+            body={"size": 5, "query": {"match_all": {}}, "_source": True},
+        )
+        samples: dict[str, str] = {}
+        for hit in result.get("hits", {}).get("hits", []):
+            _collect_sample_values(hit.get("_source", {}), "", samples)
+        return samples
+    except Exception:
+        return {}
+
+
 async def _get_mapping_fields(
     es, indices: list[str]
 ) -> tuple[str, dict[str, str]]:
@@ -184,7 +229,15 @@ async def _get_mapping_fields(
                     return (i, item[0])
             return (len(_PRIORITY_KEYWORDS), item[0])
         sorted_fields = sorted(unique, key=_priority)
-        prompt_str = ", ".join(f"{n} ({h})" for n, h in sorted_fields[:100])
+        samples = await _get_field_samples(es, indices)
+        parts: list[str] = []
+        for n, h in sorted_fields[:100]:
+            sample = samples.get(n, "")
+            if sample and h in _SAMPLE_TYPES:
+                parts.append(f"{n} ({h}, e.g. {sample})")
+            else:
+                parts.append(f"{n} ({h})")
+        prompt_str = ", ".join(parts)
         return prompt_str, field_types
     except Exception:
         return "(unavailable)", {}

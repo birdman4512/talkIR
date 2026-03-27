@@ -767,7 +767,7 @@ async function handleSubmit(e) {
                 try {
                   const resp = await fetch('/api/eql', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ query_body: q, model: state.model, provider: state.provider }),
                   });
                   const data = await resp.json();

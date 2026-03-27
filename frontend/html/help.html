@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="style.css" />
   <style>
     .help-wrap {
-      max-width: 820px;
+      max-width: 860px;
       margin: 0 auto;
       padding: 32px 24px 64px;
     }
@@ -51,6 +51,7 @@
       border: 1px solid var(--border);
       padding: 10px 14px;
       transition: border-color 0.15s;
+      cursor: pointer;
     }
     .query-card:hover { border-color: var(--muted); }
 
@@ -117,174 +118,283 @@
           <span class="tip-val">The LLM generates an optimised Elasticsearch DSL query before searching. Best for specific, structured questions. Disable for broad keyword searches or if the model is slow.</span>
         </div>
         <div class="tip">
-          <span class="tip-key">multi-query</span>
-          <span class="tip-val">For complex questions (e.g. lateral movement), the LLM may generate multiple ES queries covering different event types and combine the results automatically.</span>
-        </div>
-        <div class="tip">
           <span class="tip-key">concise</span>
           <span class="tip-val">Limits the response to 3–5 sentences. Useful for quick triage when you don't need full detail.</span>
         </div>
         <div class="tip">
-          <span class="tip-key">results</span>
-          <span class="tip-val">Controls how many log records are retrieved and sent to the LLM. Higher values give more context but slow down the response. 20–50 is a good default.</span>
+          <span class="tip-key">results slider</span>
+          <span class="tip-val">Controls how many log records are retrieved and sent to the LLM. 20–50 is a good default. Use <em>all results</em> only for aggregation queries — it can be very slow.</span>
         </div>
         <div class="tip">
           <span class="tip-key">indices</span>
-          <span class="tip-val">Select only the indices relevant to your question. Querying fewer indices is faster and reduces noise. Use <em>all</em> only when you don't know which source to target.</span>
+          <span class="tip-val">Select only the indices relevant to your question. For authentication, use <code>windows.eventlogs.rdpauth</code> or <code>windows.eventlogs.evtx</code>. For network, use <code>windows.network.netstat</code> or <code>windows.network.netstatenriched_netstat</code>.</span>
         </div>
         <div class="tip">
-          <span class="tip-key">deepseek-r1</span>
-          <span class="tip-val">Thinking models show their reasoning before answering. The reasoning block auto-collapses when the answer starts. Best for complex investigations where you want to see the logic.</span>
+          <span class="tip-key">per-host queries</span>
+          <span class="tip-val">Data is collected from multiple hosts (DC01, DC02, WKS01–WKS05, FILESVR). Narrow by asking "on DC01" or "across all workstations" — the LLM will filter by <code>host.name</code>.</span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">ECS fields</span>
+          <span class="tip-val">All data is normalised to Elastic Common Schema. Use <code>source.ip</code>, <code>destination.ip</code>, <code>user.name</code>, <code>process.name</code>, <code>host.name</code> in your questions — the LLM understands these directly.</span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">[ eql ]</span>
+          <span class="tip-val">After any query runs, click <em>[ eql ]</em> on the ES query block to convert it to Event Query Language — useful for importing into Elastic Security detection rules.</span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">show full prompt</span>
+          <span class="tip-val">Enable in the sidebar to see exactly what is sent to the LLM — both the query generation phase (field names + your question) and the analysis phase (ES results + your question). Useful for debugging unexpected answers.</span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">thinking models</span>
+          <span class="tip-val">deepseek-r1 and similar models show their reasoning before answering. The reasoning block auto-collapses when the answer starts. Best for complex multi-step investigations.</span>
         </div>
       </div>
     </section>
 
     <!-- ── Authentication ───────────────────────────────────────────────── -->
     <section class="help-section">
-      <h2>// authentication &amp; access</h2>
+      <h2>// authentication &amp; logon events</h2>
       <div class="query-grid">
         <div class="query-card">
-          <div class="query-text">Show me all failed login attempts in the last 24 hours</div>
-          <div class="query-desc">Lists accounts with authentication failures — useful for spotting brute force or password spray activity.</div>
+          <div class="query-text">Show me all failed login attempts and which accounts were targeted</div>
+          <div class="query-desc">Queries <code>event.outcome:failure</code> in RDPAuth and Evtx (EventID 4625). Groups by <code>user.name</code> to show most targeted accounts.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Which accounts have the most login failures?</div>
-          <div class="query-desc">Aggregates failure counts by username. High counts on service accounts or admin accounts are high priority.</div>
+          <div class="query-text">List usernames with both successful and failed logins, and how many of each</div>
+          <div class="query-desc">Aggregates EventID 4624 (success) and 4625 (failure) per user. Accounts with many failures followed by a success may indicate a brute force that worked.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Are there accounts with successful logins after multiple failures?</div>
-          <div class="query-desc">Identifies potential successful brute force — failure bursts followed by a success from the same IP or account.</div>
+          <div class="query-text">Which source IPs had RDP logon attempts?</div>
+          <div class="query-desc">Uses <code>source.ip</code> from RDPAuth and Evtx. Identifies external IPs attempting remote desktop access.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Show me logins outside of business hours</div>
-          <div class="query-desc">Surfaces access events between 18:00–07:00 or on weekends — common indicator of insider threat or compromised credentials.</div>
+          <div class="query-text">Show me all logon type 3 (network) events and where they came from</div>
+          <div class="query-desc">Logon type 3 covers SMB, RDP, and network shares. Unusual source IPs or off-hours timing warrants investigation (MITRE T1021).</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Give me a list of usernames and how often they signed in</div>
-          <div class="query-desc">Frequency table of authentications per user. Unusually high or low counts may warrant investigation.</div>
+          <div class="query-text">Are there logins from outside the 192.168.0.0/16 range?</div>
+          <div class="query-desc">Identifies external authentication attempts against internal systems. Any non-RFC1918 source IP for successful logins is high priority.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Which users logged in from more than one country?</div>
-          <div class="query-desc">Impossible travel — simultaneous or rapid logins from geographically distant locations.</div>
+          <div class="query-text">Which service accounts logged in interactively?</div>
+          <div class="query-desc">Service accounts (typically ending in $, or named svc_*) should not have interactive logon type 2 or 10 sessions. Indicates stolen credentials or misconfiguration.</div>
         </div>
       </div>
     </section>
 
-    <!-- ── Lateral movement ─────────────────────────────────────────────── -->
+    <!-- ── Network connections ───────────────────────────────────────────── -->
     <section class="help-section">
-      <h2>// lateral movement</h2>
+      <h2>// network connections</h2>
       <div class="query-grid">
         <div class="query-card">
-          <div class="query-text">Are there signs of lateral movement?</div>
-          <div class="query-desc">Broad sweep — covers authentication across multiple hosts, remote service use, SMB/RDP connections, and pass-the-hash indicators. Maps to MITRE T1021, T1550.</div>
+          <div class="query-text">Show me all connections to external IP addresses</div>
+          <div class="query-desc">Filters <code>destination.ip</code> for non-RFC1918 addresses. Outbound connections to public IPs may indicate C2 (T1071) or data exfiltration (T1041).</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Which users authenticated to multiple systems in a short timeframe?</div>
-          <div class="query-desc">Accounts accessing many hosts quickly may indicate automated lateral movement or credential reuse after compromise.</div>
+          <div class="query-text">Which processes have established connections and what are their destination IPs?</div>
+          <div class="query-desc">Joins <code>process.name</code> with <code>destination.ip</code> and <code>destination.port</code> from NetstatEnriched. Unusual processes with network connections are high priority.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Show me remote desktop or SMB connections between internal hosts</div>
-          <div class="query-desc">Peer-to-peer RDP and SMB activity between workstations is unusual and often indicates lateral movement (T1021.001, T1021.002).</div>
+          <div class="query-text">Are there connections on unusual ports like 4444, 8080, or 1337?</div>
+          <div class="query-desc">Common C2 and reverse shell ports. Uses <code>destination.port</code> across Netstat indices.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Are there any service account logins from workstations?</div>
-          <div class="query-desc">Service accounts authenticating interactively or from user workstations is a common sign of pass-the-ticket or stolen credentials.</div>
+          <div class="query-text">Show me all ESTABLISHED connections from DC01 and group by destination IP</div>
+          <div class="query-desc">Filters by <code>host.name:dc01</code> and <code>Status:ESTABLISHED</code>. Helps identify what a domain controller is actively communicating with.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Which processes are listening on the network and are they signed?</div>
+          <div class="query-desc">Uses NetstatEnriched to correlate listening services with <code>code_signature.trusted</code>. Unsigned listening processes are suspicious.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Find connections where the process hash is known malicious or unsigned</div>
+          <div class="query-desc">Checks <code>Authenticode_Trusted</code> and <code>Hash_SHA256</code> fields from NetstatEnriched. Untrusted processes with external connections are critical findings.</div>
         </div>
       </div>
     </section>
 
-    <!-- ── Privilege escalation ─────────────────────────────────────────── -->
-    <section class="help-section">
-      <h2>// privilege escalation &amp; persistence</h2>
-      <div class="query-grid">
-        <div class="query-card">
-          <div class="query-text">Are there any new local administrator accounts created recently?</div>
-          <div class="query-desc">Newly created privileged accounts may indicate persistence (T1136) or privilege escalation (T1078).</div>
-        </div>
-        <div class="query-card">
-          <div class="query-text">Show me privilege escalation events</div>
-          <div class="query-desc">Looks for UAC bypasses, sudo usage, token impersonation, and group membership changes.</div>
-        </div>
-        <div class="query-card">
-          <div class="query-text">Which accounts were added to privileged groups?</div>
-          <div class="query-desc">Group membership changes to Domain Admins, Administrators, or sudo-capable groups are high-value events (T1098).</div>
-        </div>
-        <div class="query-card">
-          <div class="query-text">Are there scheduled tasks or services created by unusual accounts?</div>
-          <div class="query-desc">Persistence via scheduled tasks (T1053) or new services (T1543) created by non-admin accounts warrants investigation.</div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ── Process & execution ──────────────────────────────────────────── -->
+    <!-- ── Process execution ─────────────────────────────────────────────── -->
     <section class="help-section">
       <h2>// process execution &amp; malware</h2>
       <div class="query-grid">
         <div class="query-card">
-          <div class="query-text">Show me PowerShell commands run by users</div>
-          <div class="query-desc">PowerShell abuse (T1059.001) is one of the most common living-off-the-land techniques. Look for encoded commands, download cradles, or unusual parent processes.</div>
+          <div class="query-text">Show me PowerShell commands that look suspicious</div>
+          <div class="query-desc">Searches <code>ps_suspicious:true</code> and <code>ps_indicators</code> fields across PowerShell script block and module logs. Flags encoded commands, download cradles, and known tool names.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Are there processes spawned from unusual parent processes?</div>
-          <div class="query-desc">Word/Excel spawning cmd.exe or PowerShell is a classic malicious macro indicator. Helps identify T1566 phishing outcomes.</div>
+          <div class="query-text">Are there processes spawned from unusual parents like Word or Excel?</div>
+          <div class="query-desc">Uses <code>process.parent.name</code> from EventID 4688 records. Office apps spawning cmd.exe or PowerShell indicates a malicious macro (T1566).</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Find any processes running from temp or user-writable directories</div>
-          <div class="query-desc">Malware frequently executes from %TEMP%, AppData, or Downloads to avoid detection in system directories.</div>
+          <div class="query-text">Find processes running from temp or AppData directories</div>
+          <div class="query-desc">Malware frequently executes from user-writable paths. Checks <code>process.executable</code> for %TEMP%, AppData, Downloads.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Are there signs of credential dumping?</div>
-          <div class="query-desc">Looks for LSASS access, Mimikatz-related activity, ntds.dit access, and SAM database reads (T1003).</div>
+          <div class="query-text">Show me all processes created by the Administrator account</div>
+          <div class="query-desc">Uses <code>user.name:Administrator</code> with EventID 4688 (process create). Unexpected admin-run processes during off-hours are suspicious.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">What processes ran on WKS01 that don't appear on other workstations?</div>
+          <div class="query-desc">Compares <code>process.name</code> across hosts. Unique processes on a single host can indicate targeted compromise.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Are there signs of credential dumping or LSASS access?</div>
+          <div class="query-desc">Looks for access to lsass.exe, ntds.dit, SAM database, and Mimikatz indicators in PowerShell logs and process creation events (T1003).</div>
         </div>
       </div>
     </section>
 
-    <!-- ── Network & exfiltration ───────────────────────────────────────── -->
+    <!-- ── Lateral movement ──────────────────────────────────────────────── -->
     <section class="help-section">
-      <h2>// network &amp; data exfiltration</h2>
+      <h2>// lateral movement</h2>
       <div class="query-grid">
         <div class="query-card">
-          <div class="query-text">Show me connections to external IP addresses</div>
-          <div class="query-desc">Outbound connections to non-RFC1918 addresses — useful for C2 detection (T1071) or data exfiltration (T1041).</div>
+          <div class="query-text">Are there signs of lateral movement across the domain?</div>
+          <div class="query-desc">Broad sweep across RDPAuth, Evtx, and Netstat — covers pass-the-hash, Kerberos ticket reuse, SMB connections between workstations, and authentication chains (T1021, T1550).</div>
         </div>
         <div class="query-card">
-          <div class="query-text">What are the top destination ports and how many connections to each?</div>
-          <div class="query-desc">Unusual ports (4444, 8080, 1337, high ephemeral ports) may indicate C2 channels or non-standard services.</div>
+          <div class="query-text">Which accounts authenticated to multiple different hosts?</div>
+          <div class="query-desc">Aggregates <code>user.name</code> against <code>host.name</code> across all authentication indices. Accounts touching many systems in a short window may indicate automated lateral movement.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Are there signs of data exfiltration?</div>
-          <div class="query-desc">Looks for large outbound transfers, access to bulk sensitive files, cloud sync activity, and staging behaviour (T1560, T1048).</div>
+          <div class="query-text">Show me RDP connections between workstations (not to/from domain controllers)</div>
+          <div class="query-desc">Peer-to-peer RDP between WKS hosts is unusual — legitimate admin RDP typically goes to DCs or servers, not between workstations (T1021.001).</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Find DNS queries to unusual or newly registered domains</div>
-          <div class="query-desc">DNS-based C2 (T1071.004) and DGA (Domain Generation Algorithm) traffic often appear as high-frequency queries to random-looking domains.</div>
+          <div class="query-text">Are any workstations connecting to the file server FILESVR on port 445?</div>
+          <div class="query-desc">SMB connections to file servers are normal, but unusual source hosts or times may indicate ransomware staging or data exfiltration via SMB (T1021.002).</div>
         </div>
       </div>
     </section>
 
-    <!-- ── Investigation ────────────────────────────────────────────────── -->
+    <!-- ── Persistence ───────────────────────────────────────────────────── -->
+    <section class="help-section">
+      <h2>// persistence &amp; privilege escalation</h2>
+      <div class="query-grid">
+        <div class="query-card">
+          <div class="query-text">Show me all autorun entries that are unsigned or from unusual locations</div>
+          <div class="query-desc">Queries the Autoruns index — checks <code>Signer</code> and <code>file.path</code> for persistence mechanisms in startup keys, run keys, and scheduled tasks (T1547, T1053).</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Were any new user accounts created or modified recently?</div>
+          <div class="query-desc">Searches EventID 4720 (create), 4738 (modify), 4726 (delete) in the Evtx index. New privileged accounts are a common persistence technique (T1136).</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Are there any scheduled tasks created by non-system accounts?</div>
+          <div class="query-desc">Uses EventID 4698 records — filters for <code>user.name</code> that isn't SYSTEM or a known admin. Attacker-created scheduled tasks are a reliable persistence mechanism (T1053.005).</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Show me new services installed outside of business hours</div>
+          <div class="query-desc">EventID 4697 (service install) filtered by timestamp. Malicious services are often installed during off-hours to reduce detection window (T1543.003).</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Which accounts were added to privileged groups?</div>
+          <div class="query-desc">EventID 4728/4732/4756 — group membership changes to Domain Admins, Administrators, or Remote Desktop Users are high-value events (T1098).</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── File & MFT ────────────────────────────────────────────────────── -->
+    <section class="help-section">
+      <h2>// file system &amp; MFT</h2>
+      <div class="query-grid">
+        <div class="query-card">
+          <div class="query-text">Show me executable files created in temp or AppData directories</div>
+          <div class="query-desc">Queries the NTFS MFT index for .exe, .dll, .ps1 files in user-writable paths. Malware staging almost always involves writing to these locations.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Find files with Alternate Data Streams (ADS)</div>
+          <div class="query-desc">ADS are used to hide payloads inside legitimate files (<code>file.attributes.ads:true</code> in MFT). A common defence evasion technique (T1564.004).</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">What scripts (ps1, bat, vbs) were created on the domain controller?</div>
+          <div class="query-desc">Filters MFT by <code>host.name</code> and file extension. Scripts created on DCs outside change windows are high-priority findings.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Show me files created within the last 24 hours of the collection time</div>
+          <div class="query-desc">Uses <code>file.created</code> timestamp from MFT with a date range filter. Useful for establishing what was dropped during an attack window.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Browser history ───────────────────────────────────────────────── -->
+    <section class="help-section">
+      <h2>// browser history</h2>
+      <div class="query-grid">
+        <div class="query-card">
+          <div class="query-text">What external URLs did users visit from the domain controller?</div>
+          <div class="query-desc">DCs browsing the internet is unusual. Uses <code>url.original</code> and <code>host.name</code> from Chrome/Firefox history. Any external browsing from DC01/DC02 warrants investigation.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Show me downloads or file transfer URLs visited by any user</div>
+          <div class="query-desc">Searches <code>url.original</code> for file hosting services, pastebin, or direct download links. May indicate malware delivery (T1105) or data staging (T1567).</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Which users visited IP addresses directly (not domain names)?</div>
+          <div class="query-desc">Direct IP browsing (e.g. http://1.2.3.4) bypasses DNS and is commonly used for C2 check-ins. Searches <code>url.original</code> for IP-format URLs.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Investigation ─────────────────────────────────────────────────── -->
     <section class="help-section">
       <h2>// investigation &amp; triage</h2>
       <div class="query-grid">
         <div class="query-card">
-          <div class="query-text">Summarise all activity from IP address 10.0.0.50</div>
-          <div class="query-desc">Full timeline of events associated with a specific source IP — useful when triaging an alert or investigating a known-bad indicator.</div>
+          <div class="query-text">Summarise all activity associated with IP address 192.168.111.101</div>
+          <div class="query-desc">Full cross-index sweep using <code>source.ip</code> and <code>destination.ip</code>. Shows authentication attempts, network connections, and any other events linked to that IP.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">What did user jsmith do over the last 7 days?</div>
-          <div class="query-desc">Reconstructs a user's activity timeline — authentication, process execution, network connections, and file access.</div>
+          <div class="query-text">What did the user Administrator do across all hosts?</div>
+          <div class="query-desc">Queries <code>user.name:Administrator</code> across all indices. Reconstructs a full activity timeline — logons, processes, network connections, and file access.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Give me a timeline of events between 14:00 and 16:00 yesterday</div>
-          <div class="query-desc">Narrows the search window to a specific incident period — useful when you know when an alert fired.</div>
+          <div class="query-text">Give me a timeline of everything that happened on DC01 on 2024-07-26</div>
+          <div class="query-desc">Uses <code>host.name:dc01</code> with a date range on <code>@timestamp</code>. Pulls events from all relevant indices to reconstruct a full day's activity.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">Map these events to the MITRE ATT&amp;CK framework</div>
-          <div class="query-desc">Asks the LLM to classify observed behaviours against ATT&amp;CK techniques and provide tactic/technique IDs for reporting.</div>
+          <div class="query-text">What are the most critical findings across all collected data?</div>
+          <div class="query-desc">High-level triage sweep — asks the LLM to identify the most suspicious indicators across all indices and rank them by severity. Good starting point for an investigation.</div>
         </div>
         <div class="query-card">
-          <div class="query-text">What are the most critical findings across all indices?</div>
-          <div class="query-desc">High-level triage sweep — identifies the most suspicious events across all available log sources.</div>
+          <div class="query-text">Map the suspicious activity to MITRE ATT&amp;CK techniques</div>
+          <div class="query-desc">Takes events from previous queries and classifies them against the MITRE ATT&amp;CK framework with tactic/technique IDs. Useful for writing IR reports.</div>
+        </div>
+        <div class="query-card">
+          <div class="query-text">Compare activity between DC01 and DC02 — are there differences that suggest one is compromised?</div>
+          <div class="query-desc">Baselining: unusual processes, services, or network connections on one DC that don't appear on the other may indicate targeted compromise.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Velociraptor-specific ──────────────────────────────────────────── -->
+    <section class="help-section">
+      <h2>// velociraptor collection context</h2>
+      <div class="tips-list">
+        <div class="tip">
+          <span class="tip-key">data sources</span>
+          <span class="tip-val">This data was collected by Velociraptor from: DC01, DC02 (domain controllers), FILESVR (file server), WKS01–WKS05 (workstations). All timestamps are UTC. Collection date: 2024-08-04.</span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">available indices</span>
+          <span class="tip-val">
+            <code>windows.eventlogs.evtx</code> — all Windows event logs (Security, System, Application) ·
+            <code>windows.eventlogs.rdpauth</code> — RDP/logon events only ·
+            <code>windows.network.netstat</code> — point-in-time connections ·
+            <code>windows.network.netstatenriched_netstat</code> — connections with process + hash info ·
+            <code>windows.ntfs.mft</code> — file system (executables and suspicious paths only) ·
+            <code>windows.sysinternals.autoruns</code> — persistence locations ·
+            <code>windows.eventlogs.powershellscriptblock</code> — PowerShell activity
+          </span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">point-in-time</span>
+          <span class="tip-val">Netstat data is a snapshot, not a stream — it shows connections active at collection time, not all connections that ever existed. For full network history, use authentication logs instead.</span>
+        </div>
+        <div class="tip">
+          <span class="tip-key">new log sources</span>
+          <span class="tip-val">Drop new <code>.json</code> files into <code>./logs/</code> and they will be automatically ingested. Velociraptor collections, Sysmon JSONL, Zeek logs, and Suricata EVE JSON are all supported. ECS normalisation is applied automatically for known Velociraptor artefact types.</span>
         </div>
       </div>
     </section>

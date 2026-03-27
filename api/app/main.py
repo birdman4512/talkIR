@@ -3,9 +3,10 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 
 from .config import settings
-from .es_client import close_es_client
+from .es_client import close_es_client, get_es_client
 from .auth import require_auth
 from .routes import auth, chat, indices, models
+from .es_templates import ensure_index_templates
 
 
 @asynccontextmanager
@@ -14,6 +15,8 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             "JWT_SECRET must be at least 32 characters — set it in .env"
         )
+    es = get_es_client()
+    await ensure_index_templates(es)
     yield
     await close_es_client()
 

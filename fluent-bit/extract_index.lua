@@ -203,22 +203,167 @@ local function ecs_enrich(artifact, record)
             local computer = str(sys["Computer"])
             if computer then
                 record["host"] = { name = computer:lower() }
-                record["host_name"] = computer:lower()  -- flat alias for simple searches
+                record["host_name"] = computer:lower()
             end
             local sec = sys["Security"]
             if type(sec) == "table" and str(sec["UserID"]) then
                 record["user"] = { id = sec["UserID"] }
             end
-            -- Flatten execution context
             local exec = sys["Execution"]
             if type(exec) == "table" then
                 record["process"] = { pid = exec["ProcessID"], thread = { id = exec["ThreadID"] } }
             end
         end
-        -- EventID already hoisted by Velociraptor
-        if record["EventID"] then
-            record["event"] = { code = tostring(record["EventID"]) }
+        local eid = record["EventID"]
+        if eid then
+            record["event"] = { code = tostring(eid) }
         end
+
+        -- Extract EventData for common Security EventIDs so the LLM can query
+        -- user.name, source.ip, process.name etc. without knowing raw field paths.
+        local ed = record["EventData"]
+        if type(ed) == "table" and eid then
+
+            -- ── Logon events: 4624 success, 4625 failure, 4648 explicit cred ──
+            if eid == 4624 or eid == 4625 or eid == 4648 then
+                local tuser  = str(ed["TargetUserName"])  or str(ed["SubjectUserName"])
+                local tdomain = str(ed["TargetDomainName"]) or str(ed["SubjectDomainName"])
+                if tuser and tuser ~= "-" and not tuser:match("%$$") then
+                    record["user"] = {
+                        name   = tuser,
+                        domain = tdomain,
+                        id     = str(ed["TargetUserSid"]),
+                    }
+                end
+                local raw_ip = str(ed["IpAddress"])
+                if raw_ip and raw_ip ~= "-" then
+                    raw_ip = raw_ip:gsub("^::ffff:", "")  -- strip IPv6-mapped IPv4 prefix
+                    if raw_ip ~= "::1" and raw_ip ~= "127.0.0.1" and raw_ip ~= "-" then
+                        record["source"] = {
+                            ip   = raw_ip,
+                            port = tonumber(tostring(ed["IpPort"] or "")),
+                        }
+                    end
+                end
+                local ws = str(ed["WorkstationName"])
+                if ws and ws ~= "-" then
+                    record["source"] = record["source"] or {}
+                    record["source"]["domain"] = ws
+                end
+                local logon_type = ed["LogonType"]
+                if logon_type then
+                    record["winlog"] = { logon = { type = tostring(logon_type) } }
+                end
+                if record["event"] then
+                    record["event"]["category"] = "authentication"
+                    record["event"]["outcome"]  = (eid == 4624) and "success" or "failure"
+                    record["event"]["type"]     = (eid == 4624) and "start"   or "denied"
+                end
+
+            -- ── Process creation: 4688 ─────────────────────────────────────────
+            elseif eid == 4688 then
+                local newproc = str(ed["NewProcessName"])
+                if newproc then
+                    local procname = newproc:match("([^\\]+)$") or newproc
+                    local parent   = str(ed["ParentProcessName"])
+                    record["process"] = {
+                        name         = procname,
+                        executable   = newproc,
+                        command_line = str(ed["CommandLine"]),
+                        pid          = tonumber(tostring(ed["NewProcessId"] or "")),
+                        parent       = {
+                            name = parent and (parent:match("([^\\]+)$") or parent),
+                            pid  = tonumber(tostring(ed["ProcessId"] or "")),
+                        },
+                    }
+                end
+                local suser = str(ed["SubjectUserName"])
+                if suser and suser ~= "-" then
+                    record["user"] = {
+                        name   = suser,
+                        domain = str(ed["SubjectDomainName"]),
+                        id     = str(ed["SubjectUserSid"]),
+                    }
+                end
+                if record["event"] then
+                    record["event"]["category"] = "process"
+                    record["event"]["type"]     = "start"
+                end
+
+            -- ── Account management: 4720 create, 4726 delete, 4738 change, 4740 lockout ──
+            elseif eid == 4720 or eid == 4726 or eid == 4738 or eid == 4740 then
+                local tuser = str(ed["TargetUserName"])
+                local suser = str(ed["SubjectUserName"])
+                local uobj  = {}
+                if tuser then uobj["target"] = { name = tuser } end
+                if suser and suser ~= "-" then
+                    uobj["name"]   = suser
+                    uobj["domain"] = str(ed["SubjectDomainName"])
+                end
+                if next(uobj) then record["user"] = uobj end
+                if record["event"] then
+                    record["event"]["category"] = "iam"
+                    record["event"]["type"]     = eid == 4720 and "creation"
+                                                or eid == 4726 and "deletion"
+                                                or "change"
+                end
+
+            -- ── Object / file access: 4663, 4656 ──────────────────────────────
+            elseif eid == 4663 or eid == 4656 then
+                local objname = str(ed["ObjectName"])
+                if objname then
+                    record["file"] = {
+                        path = objname,
+                        name = objname:match("([^\\]+)$") or objname,
+                    }
+                end
+                local suser = str(ed["SubjectUserName"])
+                if suser and suser ~= "-" then
+                    record["user"] = {
+                        name   = suser,
+                        domain = str(ed["SubjectDomainName"]),
+                    }
+                end
+                if record["event"] then record["event"]["category"] = "file" end
+
+            -- ── Service installation: 4697 ────────────────────────────────────
+            elseif eid == 4697 then
+                local svcname = str(ed["ServiceName"])
+                local svcfile = str(ed["ServiceFileName"])
+                if svcname then record["service"] = { name = svcname } end
+                if svcfile then
+                    record["file"] = {
+                        path = svcfile,
+                        name = svcfile:match("([^\\]+)$") or svcfile,
+                    }
+                end
+                if record["event"] then record["event"]["category"] = "configuration" end
+
+            -- ── Scheduled task: 4698 creation, 4699 deletion ─────────────────
+            elseif eid == 4698 or eid == 4699 then
+                local taskname = str(ed["TaskName"])
+                local suser    = str(ed["SubjectUserName"])
+                if taskname then
+                    record["winlog"] = { event_data = { task_name = taskname } }
+                end
+                if suser and suser ~= "-" then
+                    record["user"] = { name = suser, domain = str(ed["SubjectDomainName"]) }
+                end
+                if record["event"] then
+                    record["event"]["category"] = "configuration"
+                    record["event"]["type"]     = eid == 4698 and "creation" or "deletion"
+                end
+
+            -- ── PowerShell script block via Evtx channel: 4104 ───────────────
+            elseif eid == 4104 then
+                local sbt = str(ed["ScriptBlockText"])
+                if sbt then
+                    record["powershell"] = { script_block_text = sbt }
+                end
+                if record["event"] then record["event"]["category"] = "process" end
+
+            end  -- EventID dispatch
+        end  -- EventData table check
     end
 
     -- ── Windows.EventLogs.PowershellScriptblock / PowershellModule ───────────
