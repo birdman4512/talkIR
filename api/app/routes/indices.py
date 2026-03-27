@@ -55,8 +55,4 @@ async def list_indices(user: dict = Depends(require_auth)):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Elasticsearch error: {exc}") from exc
 
-    allowed = user.get("indices")
-    if allowed is None:
-        return all_indices
-    allowed_set = set(allowed)
-    return [idx for idx in all_indices if idx.name in allowed_set]
+    return all_indices

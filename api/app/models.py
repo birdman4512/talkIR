@@ -22,3 +22,9 @@ class ChatRequest(BaseModel):
 class IndexInfo(BaseModel):
     name: str
     doc_count: int
+
+
+class EqlRequest(BaseModel):
+    query_body: dict
+    model: Optional[str] = None
+    provider: str = "ollama"
