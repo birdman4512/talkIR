@@ -91,6 +91,14 @@ async def _get_mapping_fields(es, indices: list[str]) -> str:
         return "(unavailable)"
 
 
+_THINKING_MODEL_PATTERNS = ("deepseek", "r1", "qwq", "thinking")
+
+
+def _supports_thinking(model: str) -> bool:
+    name = model.lower()
+    return any(p in name for p in _THINKING_MODEL_PATTERNS)
+
+
 def _sanitize_query_body(body: dict) -> dict:
     """Fix common LLM query mistakes."""
     q = body.get("query", {})
@@ -216,16 +224,15 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
     else:  # ollama
+        payload: dict = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}] + messages,
+            "stream": False,
+        }
+        if _supports_thinking(model):
+            payload["think"] = True
         async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                f"{settings.ollama_host}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [{"role": "system", "content": system}] + messages,
-                    "stream": False,
-                    "think": True,
-                },
-            )
+            resp = await client.post(f"{settings.ollama_host}/api/chat", json=payload)
             data = resp.json()
             if "error" in data:
                 raise ValueError(f"Ollama error: {data['error']}")
@@ -233,22 +240,27 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
 
 
 async def _stream_query_gen_ollama(model: str, system: str, user: str):
-    """Stream Ollama query generation, yielding ('thinking', text) or ('content', text) tuples."""
+    """Stream Ollama query generation, yielding ('thinking'|'content'|'error', text) tuples."""
+    payload: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": True,
+    }
+    if _supports_thinking(model):
+        payload["think"] = True
+
     async with httpx.AsyncClient(timeout=300.0) as client:
         async with client.stream(
             "POST",
             f"{settings.ollama_host}/api/chat",
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "stream": True,
-                "think": True,
-            },
+            json=payload,
         ) as response:
             if response.status_code != 200:
+                body = await response.aread()
+                yield ("error", body.decode())
                 return
 
             in_think = False
@@ -263,6 +275,7 @@ async def _stream_query_gen_ollama(model: str, system: str, user: str):
                     continue
 
                 if "error" in chunk:
+                    yield ("error", chunk["error"])
                     return
 
                 native_think = chunk.get("message", {}).get("thinking", "")
@@ -334,11 +347,19 @@ async def _smart_search(
     # Generate query — stream for Ollama to surface thinking, batch for others
     if provider == "ollama":
         content_parts: list[str] = []
+        ollama_error: str | None = None
         async for kind, text in _stream_query_gen_ollama(model, system, query):
             if kind == "thinking":
                 yield ("query_thinking", text)
+            elif kind == "error":
+                ollama_error = text
+                break
             else:
                 content_parts.append(text)
+        if ollama_error:
+            events = await _keyword_search(indices, query, max_results)
+            yield ("result", events, None, f"Query generation failed: {ollama_error} — fell back to keyword search.")
+            return
         raw = "".join(content_parts)
     else:
         raw = await _llm_complete(provider, model, system, query)
@@ -488,11 +509,14 @@ def _partial_tag_suffix(buf: str, tag: str) -> str:
 
 
 async def _stream_ollama(model: str, messages: list[dict]):
+    payload: dict = {"model": model, "messages": messages, "stream": True}
+    if _supports_thinking(model):
+        payload["think"] = True
     async with httpx.AsyncClient(timeout=600.0) as client:
         async with client.stream(
             "POST",
             f"{settings.ollama_host}/api/chat",
-            json={"model": model, "messages": messages, "stream": True, "think": True},
+            json=payload,
         ) as response:
             if response.status_code != 200:
                 body = await response.aread()
