@@ -58,7 +58,10 @@ Example — "users signing in from 1.2.3.4":
 Example — "how often did each user sign in":
 {"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50}}},"size":0}
 
-Example — "username + source IP + count" (multi-field group-by, use composite):
+Example — "username + source IP + count, ordered by count" (nested terms agg):
+{"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50,"order":{"_count":"desc"}},"aggs":{"by_ip":{"terms":{"field":"SourceIP","size":10}}}}},"size":0}
+
+Example — "username + source IP + count" (composite agg, use when order matters across both fields):
 {"query":{"match_all":{}},"aggs":{"by_user_ip":{"composite":{"size":100,"sources":[{"user":{"terms":{"field":"UserName"}}},{"ip":{"terms":{"field":"SourceIP"}}}]}}},"size":0}""")
 
 
@@ -152,56 +155,81 @@ def _sanitize_query_body(body: dict) -> dict:
     return body
 
 
-def _extract_hits(result: dict) -> list[dict]:
-    """Extract records from an ES response — handles hits, terms aggs, and composite aggs."""
-    rows = [h["_source"] for h in result.get("hits", {}).get("hits", [])]
-    for agg_name, agg_data in result.get("aggregations", {}).items():
-        for bucket in agg_data.get("buckets", []):
-            key = bucket.get("key")
-            if isinstance(key, dict):
-                # Composite aggregation — key is a dict of field→value
-                row = dict(key)
-            else:
-                row = {agg_name: bucket.get("key_as_string") or key}
+def _flatten_agg_buckets(agg_name: str, agg_data: dict, parent: dict) -> list[dict]:
+    """Recursively flatten aggregation buckets, carrying parent field values down."""
+    rows = []
+    for bucket in agg_data.get("buckets", []):
+        key = bucket.get("key_as_string") or bucket.get("key")
+        row = {**parent, **(dict(key) if isinstance(key, dict) else {agg_name: key})}
+        # Recurse into any nested sub-aggregations
+        nested = {k: v for k, v in bucket.items() if isinstance(v, dict) and "buckets" in v}
+        if nested:
+            for sub_name, sub_data in nested.items():
+                rows.extend(_flatten_agg_buckets(sub_name, sub_data, row))
+        else:
             row["count"] = bucket.get("doc_count", 0)
             rows.append(row)
     return rows
 
 
+def _extract_hits(result: dict) -> list[dict]:
+    """Extract records from an ES response — handles hits, terms/composite/nested aggs."""
+    rows = [h["_source"] for h in result.get("hits", {}).get("hits", [])]
+    for agg_name, agg_data in result.get("aggregations", {}).items():
+        rows.extend(_flatten_agg_buckets(agg_name, agg_data, {}))
+    return rows
+
+
+def _fix_bare_keys(text: str) -> str:
+    """Quote bare JS-style object keys: { key: "v" } → { "key": "v" }."""
+    return re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r' "\1":', text)
+
+
 def _extract_json(text: str) -> dict | None:
     """Pull a JSON object out of freeform LLM output."""
     text = text.strip()
+
+    def _try(s: str) -> dict | list | None:
+        for attempt in (s, _fix_bare_keys(s)):
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError:
+                pass
+            repaired = _repair_json(attempt)
+            if repaired is not None:
+                return repaired
+        return None
+
     # Direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    result = _try(text)
+    if result is not None:
+        return result if isinstance(result, dict) else {"queries": result}
+
     # Strip markdown code fences — greedy so nested braces are captured whole
-    match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', text, re.DOTALL)
-    candidate = match.group(1) if match else None
+    m = re.search(r'```(?:json)?\s*([\[{].*[\]}])\s*```', text, re.DOTALL)
+    candidate = m.group(1) if m else None
+
+    # Fallback: find outermost object or array
     if candidate is None:
-        # Find outermost JSON object
         m2 = re.search(r'\{.*\}', text, re.DOTALL)
         candidate = m2.group(0) if m2 else None
+    if candidate is None:
+        m3 = re.search(r'\[.*\]', text, re.DOTALL)
+        candidate = m3.group(0) if m3 else None
+
     if candidate:
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-        # Repair: LLMs sometimes omit closing brackets — append what's missing
-        repaired = _repair_json(candidate)
-        if repaired is not None:
-            return repaired
+        result = _try(candidate)
+        if result is not None:
+            return result if isinstance(result, dict) else {"queries": result}
     return None
 
 
-def _repair_json(text: str) -> dict | None:
+def _repair_json(text: str) -> dict | list | None:
     """Append missing closing brackets/braces and retry parse."""
     missing_brackets = text.count('[') - text.count(']')
     missing_braces   = text.count('{') - text.count('}')
     if missing_brackets <= 0 and missing_braces <= 0:
         return None
-    # Insert missing ']' before the trailing '}' cluster so array closes first
     repaired = text.rstrip()
     trailing = ''
     while repaired.endswith('}') and missing_brackets > 0:
