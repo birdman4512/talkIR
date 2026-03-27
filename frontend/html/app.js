@@ -243,6 +243,7 @@ async function loadCatalogue() {
           <span class="catalogue-desc muted">${esc(m.desc)}</span>
         </div>
         <div class="catalogue-right">
+          ${m.low_mem ? '<span class="catalogue-badge low-mem" title="Runs on low-memory systems (&lt;2 GB RAM)">low mem</span>' : ''}
           <span class="catalogue-size muted">${esc(m.size)}</span>
           ${m.installed
             ? `<span class="catalogue-badge installed">✓</span>

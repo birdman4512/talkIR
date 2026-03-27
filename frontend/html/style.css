@@ -501,6 +501,7 @@ a.btn-term { text-decoration: none; display: flex; align-items: center; justify-
 .catalogue-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .catalogue-size  { font-size: 10px; color: var(--muted); }
 .catalogue-badge.installed { color: var(--accent); font-size: 12px; }
+.catalogue-badge.low-mem   { color: var(--accent2); border: 1px solid var(--accent2); font-size: 9px; padding: 1px 5px; letter-spacing: 0.05em; }
 .btn-pull {
   background: transparent;
   border: 1px solid var(--border);

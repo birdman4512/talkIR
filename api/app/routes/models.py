@@ -12,7 +12,9 @@ router = APIRouter()
 _MODEL_RE = re.compile(r'^[\w][\w.\-:/]{0,99}$')
 
 CATALOGUE = [
-    {"name": "llama3.2:3b",      "size": "2.0 GB", "desc": "Fast, basic analysis"},
+    {"name": "llama3.2:1b",       "size": "1.3 GB", "desc": "Minimal footprint, fast responses",        "low_mem": True},
+    {"name": "deepseek-r1:1.5b",  "size": "1.1 GB", "desc": "Thinking model, low memory",               "low_mem": True},
+    {"name": "llama3.2:3b",       "size": "2.0 GB", "desc": "Fast, basic analysis"},
     {"name": "mistral:7b",        "size": "4.4 GB", "desc": "Good balance of speed and quality"},
     {"name": "llama3.1:8b",       "size": "4.9 GB", "desc": "Strong reasoning"},
     {"name": "qwen2.5:7b",        "size": "4.4 GB", "desc": "Best structured output (lists, tables)"},
