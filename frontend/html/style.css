@@ -512,6 +512,22 @@ a.btn-term { text-decoration: none; display: flex; align-items: center; justify-
   padding: 2px 0 0 14px;
 }
 
+/* ─── Copy button ─────────────────────────────────────────────────────────── */
+.btn-copy {
+  display: none;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 2px 0 0 14px;
+  cursor: pointer;
+  transition: color 0.1s;
+  text-align: left;
+}
+.btn-copy:hover { color: var(--accent); }
+.msg:hover .btn-copy { display: block; }
+
 /* ─── Model guide ─────────────────────────────────────────────────────────── */
 .model-guide {
   display: flex;

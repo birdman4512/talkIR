@@ -118,7 +118,10 @@ Example — "username + source IP + count" (composite agg):
 {"query":{"match_all":{}},"aggs":{"by_user_ip":{"composite":{"size":100,"sources":[{"user":{"terms":{"field":"UserName"}}},{"ip":{"terms":{"field":"SourceIP"}}}]}}},"size":0}
 
 Example — "events in the last 24 hours" (date range):
-{"query":{"range":{"@timestamp":{"gte":"now-24h","lte":"now"}}},"size":20}""")
+{"query":{"range":{"@timestamp":{"gte":"now-24h","lte":"now"}}},"size":20}
+
+Example — "per user: count successful vs failed logins" (filter sub-aggs — use this pattern for conditional counts within buckets, NOT bucket_count which does not exist):
+{"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50},"aggs":{"successful":{"filter":{"terms":{"EventID":[4624]}}},"failed":{"filter":{"terms":{"EventID":[4625]}}}}}},"size":0}""")
 
 
 def _collect_fields(props: dict, prefix: str, out: list[tuple[str, str]]):
@@ -213,6 +216,30 @@ def _fix_agg_fields(aggs: dict, field_types: dict[str, str]) -> None:
             _fix_agg_fields(sub, field_types)
 
 
+def _extract_referenced_fields(obj, out: set[str] | None = None) -> set[str]:
+    """Recursively collect every 'field' value referenced in a query/agg body."""
+    if out is None:
+        out = set()
+    if isinstance(obj, dict):
+        if "field" in obj and isinstance(obj["field"], str):
+            out.add(obj["field"])
+        for v in obj.values():
+            _extract_referenced_fields(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_referenced_fields(item, out)
+    return out
+
+
+def _check_unknown_fields(body: dict, field_types: dict[str, str]) -> list[str]:
+    """Return field names used in body that are not in field_types."""
+    all_known = set(field_types.keys()) | {f + ".keyword" for f in field_types}
+    # Also allow meta fields
+    all_known |= {"_id", "_index", "_score", "_type", "@timestamp"}
+    used = _extract_referenced_fields(body)
+    return sorted(f for f in used if f not in all_known)
+
+
 _THINKING_MODEL_PATTERNS = ("deepseek", "r1", "qwq", "thinking")
 
 
@@ -247,20 +274,39 @@ def _friendly_ollama_error(raw: str) -> str:
 
 def _sanitize_query_body(body: dict) -> dict:
     """Fix common LLM query mistakes."""
+    # Missing "query" key — add match_all so the body is valid
+    if "query" not in body:
+        body["query"] = {"match_all": {}}
+
     q = body.get("query", {})
     if isinstance(q, dict):
-        if len(q) > 1:
+        # aggs/aggregations inside query — hoist to top level
+        for agg_key in ("aggs", "aggregations"):
+            if agg_key in q:
+                body[agg_key] = q.pop(agg_key)
+        # size inside query — hoist to top level
+        if "size" in q:
+            body.setdefault("size", q.pop("size"))
+        # After hoisting, if query is now empty replace with match_all
+        if not q:
+            body["query"] = {"match_all": {}}
+        elif len(q) > 1:
             # Multiple sibling keys — wrap in bool.must
             body["query"] = {"bool": {"must": [{k: v} for k, v in q.items()]}}
         elif "match_all" in q and q["match_all"]:
             # match_all must be empty — LLM sometimes puts fields inside it
             body["query"]["match_all"] = {}
 
+    aggs = body.get("aggs", body.get("aggregations", {}))
+
     # size:0 with no aggregations returns nothing — remove the override and
     # let _run_query apply its normal cap instead
-    aggs = body.get("aggs", body.get("aggregations", {}))
     if body.get("size") == 0 and not aggs:
         del body["size"]
+
+    # aggs present but no size set — default to 0 (return buckets only)
+    if aggs and "size" not in body:
+        body["size"] = 0
 
     # Fix composite sources that are strings instead of source-objects
     # e.g. "sources": ["UserName"] → "sources": [{"UserName": {"terms": {"field": "UserName"}}}]
@@ -276,7 +322,71 @@ def _sanitize_query_body(body: dict) -> dict:
                     fixed.append(src)
             composite["sources"] = fixed
 
+    # Fix typeless aggs — agg entries with only an "aggs" key and no type.
+    # LLMs sometimes emit sibling aggs as containers instead of sub-aggs of the
+    # bucket agg they belong to.  e.g.:
+    #   "user_stats": {"terms": {...}}          ← bucket agg
+    #   "user_success": {"aggs": {"s": {...}}}  ← typeless — LLM forgot the type
+    # Fix: find the bucket agg siblings and move the sub-aggs into them.
+    _fix_typeless_aggs(aggs)
+
     return body
+
+
+_BUCKET_AGG_TYPES = frozenset({
+    "terms", "composite", "date_histogram", "histogram", "range", "date_range",
+    "filters", "filter", "nested", "reverse_nested", "sampler", "missing", "global",
+    "geotile_grid", "geohex_grid",
+})
+
+
+def _fix_typeless_aggs(aggs: dict) -> None:
+    """
+    Mutate aggs in-place: merge typeless container aggs into the nearest bucket agg.
+
+    A typeless agg has only 'aggs'/'aggregations' keys and no ES agg type.
+    When exactly one bucket agg sibling exists, the orphaned sub-aggs are moved
+    into it.  When no bucket sibling exists, the sub-aggs are promoted to the
+    current level (flattened).  If multiple bucket siblings exist, the sub-aggs
+    are merged into the first one found.
+    """
+    typeless = {
+        name: defn for name, defn in aggs.items()
+        if isinstance(defn, dict)
+        and not any(k in _BUCKET_AGG_TYPES or k in ("min", "max", "avg", "sum",
+                    "cardinality", "value_count", "stats", "extended_stats",
+                    "percentiles", "top_hits", "bucket_sort", "bucket_selector",
+                    "moving_avg", "derivative", "cumulative_sum", "scripted_metric")
+                    for k in defn)
+        and ("aggs" in defn or "aggregations" in defn)
+    }
+    if not typeless:
+        return
+
+    # Find bucket agg siblings to absorb the orphaned sub-aggs
+    bucket_name = next(
+        (n for n, d in aggs.items()
+         if n not in typeless and isinstance(d, dict)
+         and any(k in _BUCKET_AGG_TYPES for k in d)),
+        None,
+    )
+
+    for name, defn in typeless.items():
+        orphaned_sub = defn.get("aggs") or defn.get("aggregations") or {}
+        if bucket_name:
+            target = aggs[bucket_name].setdefault("aggs", {})
+            target.update(orphaned_sub)
+        else:
+            # No bucket sibling — promote sub-aggs to current level
+            aggs.update(orphaned_sub)
+        del aggs[name]
+
+    # Recurse into all remaining agg sub-trees
+    for defn in list(aggs.values()):
+        if isinstance(defn, dict):
+            sub = defn.get("aggs") or defn.get("aggregations")
+            if isinstance(sub, dict):
+                _fix_typeless_aggs(sub)
 
 
 def _flatten_agg_buckets(agg_name: str, agg_data: dict, parent: dict) -> list[dict]:
@@ -312,8 +422,9 @@ def _fix_bare_keys(text: str) -> str:
 def _extract_json(text: str) -> dict | None:
     """Pull a JSON object out of freeform LLM output."""
     text = text.strip()
-    # Strip JS-style // line comments (LLMs often add these inside JSON)
-    text = re.sub(r'//[^\n"]*', '', text)
+    # Strip JS/C-style comments (LLMs often add these inside JSON)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)  # /* block comments */
+    text = re.sub(r'//[^\n"]*', '', text)                   # // line comments
 
     def _try(s: str) -> dict | list | None:
         for attempt in (s, _fix_bare_keys(s)):
@@ -560,15 +671,18 @@ async def _smart_search(
             yield ("result", events, None, "LLM returned empty queries list — fell back to keyword search.")
             return
 
-        valid_raw = [qb for qb in raw_queries[:3] if isinstance(qb, dict) and "query" in qb]
+        valid_raw = [qb for qb in raw_queries[:3] if isinstance(qb, dict)]
         if not valid_raw:
             events = await _keyword_search(indices, query, max_results)
             yield ("result", events, None, "No valid query objects in LLM response — fell back to keyword search.")
             return
 
-        # Fix text/text+kw fields in aggregations before running
+        # Sanitize structure first (hoist aggs from inside query), then fix field types
+        unknown_fields: list[str] = []
         for qb in valid_raw:
+            _sanitize_query_body(qb)
             _fix_agg_fields(qb.get("aggs", qb.get("aggregations", {})), field_types)
+            unknown_fields.extend(_check_unknown_fields(qb, field_types))
 
         per_query = max(1, max_results // len(valid_raw))
         total = len(valid_raw)
@@ -610,18 +724,26 @@ async def _smart_search(
                 seen.add(k)
                 deduped.append(e)
 
-        fallback = f"Some queries failed: {'; '.join(errors)}" if errors else None
+        parts = []
+        if errors:
+            parts.append(f"Some queries failed: {'; '.join(errors)}")
+        if unknown_fields:
+            parts.append(f"Warning: unknown field(s) used: {', '.join(sorted(set(unknown_fields)))}")
+        fallback = "\n\n".join(parts) if parts else None
         yield ("result", deduped[:max_results], valid_bodies, fallback)
 
     else:
         # ── Single query ────────────────────────────────────────────────────────
+        _sanitize_query_body(parsed)  # hoist aggs from inside query before fixing field types
         _fix_agg_fields(parsed.get("aggs", parsed.get("aggregations", {})), field_types)
+        unknown = _check_unknown_fields(parsed, field_types)
+        unknown_warn = (f"\n\nWarning: query used unknown field(s): {', '.join(unknown)} — these do not exist in the index and will return no results. Available fields: {', '.join(sorted(field_types)[:20])}..." if unknown else None)
         try:
             events = await _run_query(es, target, parsed, max_results)
-            yield ("result", events, parsed, None)
+            yield ("result", events, parsed, unknown_warn)
         except Exception as exc:
             events = await _keyword_search(indices, query, max_results)
-            yield ("result", events, parsed, f"Generated query failed ({exc}) — fell back to keyword search.\n\nFailing query: {json.dumps(parsed, separators=(',', ':'))[:400]}")
+            yield ("result", events, parsed, f"Generated query failed ({exc}) — fell back to keyword search.\n\nFailing query: {json.dumps(parsed, separators=(',', ':'))[:400]}{unknown_warn or ''}")
 
 
 async def _keyword_search(indices: list[str], query: str, max_results: int) -> list[dict]:

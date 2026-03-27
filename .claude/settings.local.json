@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(docker ps:*)",
-      "Bash(docker compose:*)"
+      "Bash(docker compose:*)",
+      "Bash(docker exec:*)"
     ]
   }
 }

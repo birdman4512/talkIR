@@ -154,7 +154,7 @@ function _renderIndices() {
 
   indicesList.innerHTML = visible.map(idx => `
     <label class="check-label">
-      <input type="checkbox" class="index-cb" value="${esc(idx.name)}" checked />
+      <input type="checkbox" class="index-cb" value="${esc(idx.name)}" />
       ${esc(idx.name)}
       <span class="index-meta">${idx.doc_count.toLocaleString()} docs</span>
     </label>
@@ -778,6 +778,7 @@ async function handleSubmit(e) {
             if (chunk.done) {
               assistantBubble.classList.remove('cursor');
               stopGenStats(chunk.stats);
+              _addCopyBtn(msgEl, () => fullReply);
             }
             scrollToBottom();
           }
@@ -786,6 +787,7 @@ async function handleSubmit(e) {
     }
 
     assistantBubble.classList.remove('cursor');
+    if (fullReply) _addCopyBtn(msgEl, () => fullReply);
     state.conversationHistory.push({ role: 'assistant', content: fullReply });
 
   } catch (err) {
@@ -807,6 +809,24 @@ async function handleSubmit(e) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function _addCopyBtn(msgEl, getText) {
+  const btn = document.createElement('button');
+  btn.className = 'btn-copy';
+  btn.title = 'Copy to clipboard';
+  btn.textContent = '[ copy ]';
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(getText());
+      btn.textContent = '[ copied ]';
+      setTimeout(() => { btn.textContent = '[ copy ]'; }, 1500);
+    } catch {
+      btn.textContent = '[ failed ]';
+      setTimeout(() => { btn.textContent = '[ copy ]'; }, 1500);
+    }
+  });
+  msgEl.appendChild(btn);
+}
+
 function appendMessage(role, text, returnBubble = false) {
   const msg    = document.createElement('div');
   msg.className = `msg ${role}`;
@@ -815,6 +835,9 @@ function appendMessage(role, text, returnBubble = false) {
   if (role === 'assistant') bubble.classList.add('cursor');
   bubble.textContent = text;
   msg.appendChild(bubble);
+  if (role === 'assistant' && text) {
+    _addCopyBtn(msg, () => bubble.textContent);
+  }
   messagesEl.appendChild(msg);
   scrollToBottom();
   return returnBubble ? bubble : msg;
