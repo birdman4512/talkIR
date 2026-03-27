@@ -256,9 +256,14 @@ def _sanitize_query_body(body: dict) -> dict:
             # match_all must be empty — LLM sometimes puts fields inside it
             body["query"]["match_all"] = {}
 
+    # size:0 with no aggregations returns nothing — remove the override and
+    # let _run_query apply its normal cap instead
+    aggs = body.get("aggs", body.get("aggregations", {}))
+    if body.get("size") == 0 and not aggs:
+        del body["size"]
+
     # Fix composite sources that are strings instead of source-objects
     # e.g. "sources": ["UserName"] → "sources": [{"UserName": {"terms": {"field": "UserName"}}}]
-    aggs = body.get("aggs", body.get("aggregations", {}))
     for agg_def in aggs.values():
         composite = agg_def.get("composite", {})
         sources = composite.get("sources")

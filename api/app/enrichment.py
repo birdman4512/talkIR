@@ -6,7 +6,10 @@ import httpx
 
 from .config import settings
 
-_IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+_IP_RE = re.compile(
+    r'\b(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}'
+    r'(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\b'
+)
 _PRIVATE = re.compile(
     r'^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)'
 )

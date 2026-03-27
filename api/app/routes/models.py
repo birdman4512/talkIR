@@ -1,3 +1,4 @@
+import json
 import re
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -52,7 +53,7 @@ async def model_catalogue(_: dict = Depends(require_auth)):
 
 
 class PullRequest(BaseModel):
-    model: str = Field(..., pattern=r'^[\w][\w.\-:/]{0,99}$')
+    model: str = Field(..., pattern=_MODEL_RE.pattern)
 
 
 @router.delete("/models/{model:path}")
@@ -90,7 +91,7 @@ async def pull_model(req: PullRequest, _: dict = Depends(require_auth)):
                         if line:
                             yield f"data: {line}\n\n"
         except Exception as exc:
-            yield f'data: {{"error": "{exc}"}}\n\n'
+            yield f'data: {{"error": {json.dumps(str(exc))}}}\n\n'
 
     return StreamingResponse(
         stream(),
