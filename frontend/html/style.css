@@ -618,7 +618,30 @@ a.btn-term { text-decoration: none; display: flex; align-items: center; justify-
 }
 .settings-section .section-title {
   margin-bottom: 10px;
+  flex-wrap: wrap;
+  gap: 6px;
 }
+.catalogue-sort-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+.sort-label { color: var(--muted); font-size: 10px; margin-right: 2px; }
+.btn-sort {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  cursor: pointer;
+  transition: border-color 0.1s, color 0.1s;
+}
+.btn-sort:hover          { border-color: var(--muted); color: var(--text); }
+.btn-sort.active         { border-color: var(--accent); color: var(--accent); }
+.btn-sort[data-dir=desc]::after { content: ' ↓'; }
+.btn-sort[data-dir=asc]::after  { content: ' ↑'; }
 
 /* ─── Utility ─────────────────────────────────────────────────────────────── */
 .muted { color: var(--muted); }

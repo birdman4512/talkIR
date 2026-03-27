@@ -230,50 +230,91 @@ function getSelectedModel()    { return modelSelect.value || ''; }
 function getSelectedProvider() { return providerSelect.value || 'ollama'; }
 
 // ─── Model catalogue ──────────────────────────────────────────────────────────
+const _catalogueSort = { key: 'default', dir: 1 };
+let   _catalogueModels = [];
+
+const _speedOrder = { fast: 0, medium: 1, slow: 2 };
+
+function _sortedModels() {
+  const { key, dir } = _catalogueSort;
+  if (key === 'default') return [..._catalogueModels];
+  return [..._catalogueModels].sort((a, b) => {
+    let av, bv;
+    if (key === 'ram')       { av = a.ram  ?? 99;              bv = b.ram  ?? 99; }
+    if (key === 'speed')     { av = _speedOrder[a.speed] ?? 9; bv = _speedOrder[b.speed] ?? 9; }
+    if (key === 'name')      { av = a.name;                    bv = b.name; }
+    if (key === 'installed') { av = a.installed ? 0 : 1;       bv = b.installed ? 0 : 1; }
+    if (av < bv) return -dir;
+    if (av > bv) return  dir;
+    return 0;
+  });
+}
+
+function _renderCatalogue() {
+  catalogueList.innerHTML = _sortedModels().map(m => {
+    const allTags = [
+      ...(m.low_mem ? ['low mem'] : []),
+      ...(m.speed   ? [m.speed]   : []),
+      ...(m.tags    || []),
+    ];
+    const tagHtml = allTags.map(t =>
+      `<span class="tag-pill tag-${t.replace(/\s+/g,'-')}">${esc(t)}</span>`
+    ).join('');
+    return `
+    <div class="catalogue-row" data-model="${esc(m.name)}">
+      <div class="catalogue-info">
+        <div class="catalogue-name-row">
+          <span class="catalogue-name">${esc(m.name)}</span>
+          <span class="catalogue-tags">${tagHtml}</span>
+        </div>
+        <span class="catalogue-desc muted">${esc(m.desc)}</span>
+      </div>
+      <div class="catalogue-right">
+        <span class="catalogue-size muted">${esc(m.size)}</span>
+        ${m.installed
+          ? `<span class="catalogue-badge installed">✓</span>
+             <button class="btn-delete" data-model="${esc(m.name)}" title="Delete model">✕</button>`
+          : `<button class="btn-pull" data-model="${esc(m.name)}">↓</button>`}
+      </div>
+    </div>`;
+  }).join('');
+
+  catalogueList.querySelectorAll('.btn-pull').forEach(btn => {
+    btn.addEventListener('click', () => pullModel(btn.dataset.model, btn));
+  });
+  catalogueList.querySelectorAll('.btn-delete').forEach(btn => {
+    btn.addEventListener('click', () => deleteModel(btn.dataset.model, btn));
+  });
+}
+
 async function loadCatalogue() {
   catalogueList.innerHTML = '<span class="muted">Loading…</span>';
   try {
     const resp = await fetch('/api/models/catalogue');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const models = await resp.json();
-    catalogueList.innerHTML = models.map(m => {
-      const allTags = [
-        ...(m.low_mem ? ['low mem'] : []),
-        ...(m.speed   ? [m.speed]   : []),
-        ...(m.tags    || []),
-      ];
-      const tagHtml = allTags.map(t =>
-        `<span class="tag-pill tag-${t.replace(/\s+/g,'-')}">${esc(t)}</span>`
-      ).join('');
-      return `
-      <div class="catalogue-row" data-model="${esc(m.name)}">
-        <div class="catalogue-info">
-          <div class="catalogue-name-row">
-            <span class="catalogue-name">${esc(m.name)}</span>
-            <span class="catalogue-tags">${tagHtml}</span>
-          </div>
-          <span class="catalogue-desc muted">${esc(m.desc)}</span>
-        </div>
-        <div class="catalogue-right">
-          <span class="catalogue-size muted">${esc(m.size)}</span>
-          ${m.installed
-            ? `<span class="catalogue-badge installed">✓</span>
-               <button class="btn-delete" data-model="${esc(m.name)}" title="Delete model">✕</button>`
-            : `<button class="btn-pull" data-model="${esc(m.name)}">↓</button>`}
-        </div>
-      </div>`;
-    }).join('');
-
-    catalogueList.querySelectorAll('.btn-pull').forEach(btn => {
-      btn.addEventListener('click', () => pullModel(btn.dataset.model, btn));
-    });
-    catalogueList.querySelectorAll('.btn-delete').forEach(btn => {
-      btn.addEventListener('click', () => deleteModel(btn.dataset.model, btn));
-    });
+    _catalogueModels = await resp.json();
+    _renderCatalogue();
   } catch (err) {
     catalogueList.innerHTML = `<span class="muted">Error: ${esc(String(err))}</span>`;
   }
 }
+
+// Sort button wiring
+document.querySelectorAll('.btn-sort').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const key = btn.dataset.sort;
+    if (_catalogueSort.key === key) {
+      _catalogueSort.dir *= -1;               // toggle direction on second click
+    } else {
+      _catalogueSort.key = key;
+      _catalogueSort.dir = 1;
+    }
+    document.querySelectorAll('.btn-sort').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    btn.dataset.dir = _catalogueSort.dir === 1 ? 'asc' : 'desc';
+    _renderCatalogue();
+  });
+});
 
 async function pullModel(modelName, btn) {
   const row = btn.closest('.catalogue-row');
