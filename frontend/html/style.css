@@ -102,6 +102,22 @@ body                     { font-family: var(--font-mono); background: var(--bg);
   letter-spacing: 0.04em;
 }
 
+/* Indices filter */
+.indices-filter {
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  border: 1px solid var(--dim);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 3px 6px;
+  margin-bottom: 4px;
+  outline: none;
+}
+.indices-filter:focus { border-color: var(--accent); }
+.indices-filter::placeholder { color: var(--dim); }
+
 /* Indices list */
 .indices-list {
   display: flex;

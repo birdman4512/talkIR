@@ -124,29 +124,44 @@ selectAllCb.addEventListener('change', toggleSelectAll);
 chatForm.addEventListener('submit', handleSubmit);
 
 // ─── Indices ──────────────────────────────────────────────────────────────────
+const indicesFilterInput = document.getElementById('indicesFilter');
+let _allIndices = [];
+
 async function loadIndices() {
   indicesList.innerHTML = '<span class="muted">Loading…</span>';
   try {
     const resp = await fetch('/api/indices');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const indices = await resp.json();
-
-    if (indices.length === 0) {
-      indicesList.innerHTML = '<span class="muted">No indices yet — drop .json files into ./logs/</span>';
-      return;
-    }
-
-    indicesList.innerHTML = indices.map(idx => `
-      <label class="check-label">
-        <input type="checkbox" class="index-cb" value="${esc(idx.name)}" checked />
-        ${esc(idx.name)}
-        <span class="index-meta">${idx.doc_count.toLocaleString()} docs</span>
-      </label>
-    `).join('');
+    _allIndices = await resp.json();
+    _renderIndices();
   } catch (err) {
     indicesList.innerHTML = `<span class="muted">Error: ${esc(String(err))}</span>`;
   }
 }
+
+function _renderIndices() {
+  const term = indicesFilterInput.value.trim().toLowerCase();
+  const visible = term ? _allIndices.filter(idx => idx.name.toLowerCase().includes(term)) : _allIndices;
+
+  if (_allIndices.length === 0) {
+    indicesList.innerHTML = '<span class="muted">No indices yet — drop .json files into ./logs/</span>';
+    return;
+  }
+  if (visible.length === 0) {
+    indicesList.innerHTML = '<span class="muted">No matches</span>';
+    return;
+  }
+
+  indicesList.innerHTML = visible.map(idx => `
+    <label class="check-label">
+      <input type="checkbox" class="index-cb" value="${esc(idx.name)}" checked />
+      ${esc(idx.name)}
+      <span class="index-meta">${idx.doc_count.toLocaleString()} docs</span>
+    </label>
+  `).join('');
+}
+
+indicesFilterInput.addEventListener('input', _renderIndices);
 
 function getSelectedIndices() {
   return [...document.querySelectorAll('.index-cb:checked')].map(cb => cb.value);
