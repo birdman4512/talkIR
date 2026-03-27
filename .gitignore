@@ -5,11 +5,12 @@
 certs/
 !certs/.gitkeep
 
-# Log files dropped by users (keep the sample)
-logs/**/*.json
-logs/**/*.log
+# Log files dropped by users (keep the directory marker)
+logs/
 !logs/.gitkeep
-!logs/sample_auth.json
+
+# Outbound request logs (threat intel, LLM calls)
+request_logs/
 
 # Python
 __pycache__/
@@ -28,6 +29,11 @@ venv/
 # Docker build artefacts
 *.tar
 
+# Fluent Bit tail position database
+fluent-bit/*.db
+fluent-bit/*.db-shm
+fluent-bit/*.db-wal
+
 # IDE
 .vscode/
 .idea/
@@ -37,6 +43,3 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-
-#Logs Directory
-logs/

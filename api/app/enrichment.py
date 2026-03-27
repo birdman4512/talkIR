@@ -75,13 +75,23 @@ async def _lookup_abuseipdb(ip: str) -> dict:
 async def _lookup_virustotal(ip: str) -> dict:
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(url, headers={"x-apikey": settings.virustotal_api_key})
-        except Exception as exc:
-            log_request(url, ip=ip, source="virustotal", error=str(exc))
-            return {}
-        if resp.status_code != 200:
-            log_request(url, ip=ip, source="virustotal", status_code=resp.status_code, error=resp.text[:200])
+        for attempt in range(3):
+            try:
+                resp = await client.get(url, headers={"x-apikey": settings.virustotal_api_key})
+            except Exception as exc:
+                log_request(url, ip=ip, source="virustotal", error=str(exc))
+                return {}
+            if resp.status_code == 429:
+                wait = 60 * (attempt + 1)
+                log_request(url, ip=ip, source="virustotal", status_code=429,
+                            error=f"rate limited — waiting {wait}s before retry")
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code != 200:
+                log_request(url, ip=ip, source="virustotal", status_code=resp.status_code, error=resp.text[:200])
+                return {}
+            break
+        else:
             return {}
         attrs = resp.json().get("data", {}).get("attributes", {})
         stats = attrs.get("last_analysis_stats", {})

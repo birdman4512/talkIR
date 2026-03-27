@@ -1324,7 +1324,10 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
             else:
                 yield f"data: {json.dumps({'enrich_status': f'looking up {len(ips)} IP(s)…'})}\n\n"
                 enrichments: list[dict] = []
-                for ip in ips:
+                for idx, ip in enumerate(ips):
+                    # VirusTotal free tier: 4 req/min — space out calls after the first
+                    if idx > 0 and settings.virustotal_api_key:
+                        await asyncio.sleep(16)
                     try:
                         result = await enrich_ip(ip)
                         enrichments.append(result)
