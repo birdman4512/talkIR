@@ -239,10 +239,9 @@ local function ecs_enrich(artifact, record)
                 if raw_ip and raw_ip ~= "-" then
                     raw_ip = raw_ip:gsub("^::ffff:", "")  -- strip IPv6-mapped IPv4 prefix
                     if raw_ip ~= "::1" and raw_ip ~= "127.0.0.1" and raw_ip ~= "-" then
-                        record["source"] = {
-                            ip   = raw_ip,
-                            port = tonumber(tostring(ed["IpPort"] or "")),
-                        }
+                        record["source"] = record["source"] or {}
+                        record["source"]["ip"]   = raw_ip
+                        record["source"]["port"] = tonumber(ed["IpPort"]) or nil
                     end
                 end
                 local ws = str(ed["WorkstationName"])

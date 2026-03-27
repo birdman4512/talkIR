@@ -10,6 +10,7 @@ from ..auth import require_auth
 from ..es_client import get_es_client
 from ..models import ChatRequest, EqlRequest
 from ..config import settings
+from ..request_log import log_request
 
 router = APIRouter()
 
@@ -423,11 +424,13 @@ def _sanitize_query_body(body: dict) -> dict:
 
     aggs = body.get("aggs", body.get("aggregations", {}))
 
-    # LLMs sometimes put "size" as a sibling key inside the aggs object rather
-    # than at the top level — hoist it out and remove from aggs.
+    # LLMs sometimes put "size" or "_source" as sibling keys inside the aggs
+    # object rather than at the top level — hoist them out and remove from aggs.
     for agg_key in ("aggs", "aggregations"):
-        if agg_key in body and isinstance(body[agg_key], dict) and "size" in body[agg_key]:
-            body.setdefault("size", body[agg_key].pop("size"))
+        if agg_key in body and isinstance(body[agg_key], dict):
+            for hoist_key in ("size", "_source"):
+                if hoist_key in body[agg_key]:
+                    body.setdefault(hoist_key, body[agg_key].pop(hoist_key))
     # Re-read aggs after potential mutation above
     aggs = body.get("aggs", body.get("aggregations", {}))
 
@@ -700,9 +703,10 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
     if provider == "claude":
         if not settings.anthropic_api_key:
             raise ValueError("ANTHROPIC_API_KEY is not configured in .env")
+        url = "https://api.anthropic.com/v1/messages"
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                url,
                 headers={
                     "x-api-key": settings.anthropic_api_key,
                     "anthropic-version": "2023-06-01",
@@ -710,18 +714,23 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
                 },
                 json={"model": model, "max_tokens": 2048, "system": system, "messages": messages},
             )
+            log_request(url, method="POST", source="claude", status_code=resp.status_code,
+                        response_summary={"model": model, "prompt_chars": len(system) + len(user)})
             data = resp.json()
             return data.get("content", [{}])[0].get("text", "")
 
     elif provider == "openai":
         if not settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY is not configured in .env")
+        url = "https://api.openai.com/v1/chat/completions"
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                url,
                 headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
                 json={"model": model, "messages": [{"role": "system", "content": system}] + messages},
             )
+            log_request(url, method="POST", source="openai", status_code=resp.status_code,
+                        response_summary={"model": model, "prompt_chars": len(system) + len(user)})
             data = resp.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
@@ -735,6 +744,8 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
             payload["think"] = True
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(f"{settings.ollama_host}/api/chat", json=payload)
+            if resp.status_code != 200:
+                raise ValueError(_friendly_ollama_error(resp.text[:300]))
             data = resp.json()
             if "error" in data:
                 raise ValueError(_friendly_ollama_error(data["error"]))
@@ -1140,6 +1151,8 @@ async def _stream_claude(model: str, messages: list[dict]):
     system = next((m["content"] for m in messages if m["role"] == "system"), "")
     non_system = [m for m in messages if m["role"] != "system"]
 
+    log_request("https://api.anthropic.com/v1/messages", method="POST", source="claude",
+                response_summary={"model": model, "prompt_chars": len(system)})
     async with httpx.AsyncClient(timeout=600.0) as client:
         async with client.stream(
             "POST",
@@ -1195,6 +1208,8 @@ async def _stream_openai(model: str, messages: list[dict]):
         yield ("error", "OPENAI_API_KEY is not set in .env", False, {})
         return
 
+    log_request("https://api.openai.com/v1/chat/completions", method="POST", source="openai",
+                response_summary={"model": model})
     async with httpx.AsyncClient(timeout=600.0) as client:
         async with client.stream(
             "POST",
@@ -1364,18 +1379,101 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
 _EQL_SYSTEM = """Convert the given Elasticsearch Query DSL JSON into an equivalent Elasticsearch EQL (Event Query Language) query.
 
-EQL syntax rules:
-- Every query starts with an event category or "any": any where <condition>
-- Use "and", "or", "not" for logic; "in ()", "like~", ":" for matching
-- Numeric comparisons: ==, !=, <, >, <=, >=
-- For sequences: sequence [event1] [event2]
-- Field names are unquoted: EventID == 4624
-- String values are quoted: UserName == "SYSTEM"
-- Wildcards: UserName like~ "admin*"
-- For aggregation queries (aggs) that count per field, convert to:
-  any where <filter_condition> | stats count() by <field>
+Output ONLY the EQL string — no explanation, no markdown, no code fences.
 
-Output ONLY the EQL string — no explanation, no markdown, no code fences."""
+═══ SYNTAX ═══
+
+Every EQL query: <event_type> where <condition>
+  - Use "any" when the event type is unknown or irrelevant: any where <condition>
+  - Event type is a bare word, not quoted: any where ...  NOT  "any" where ...
+
+Logical operators (lowercase only — AND / OR / NOT are invalid):
+  and, or, not
+
+Comparison operators:
+  ==  !=  <  >  <=  >=
+
+String matching:
+  field == "exact_value"          exact match (case-sensitive)
+  field != "value"                not equal
+  field like "admin*"             wildcard, case-sensitive
+  field like~ "admin*"            wildcard, case-insensitive  ← prefer this
+  field : "value"                 match (like == but works across types)
+  field in ("a", "b", "c")       multi-value OR (equivalent to terms)
+  field not in ("a", "b")        multi-value NOT
+
+Numeric / IP comparisons:
+  EventID == 4624
+  source.ip == "192.168.1.1"     IP fields are still quoted strings in EQL
+
+Null / existence checks:
+  field != null                   field exists and is not null
+  field == null                   field is null or missing
+
+Wildcards in field names are NOT allowed — field names must be exact.
+
+═══ AGGREGATIONS / PIPES ═══
+
+Pipes transform results — append after the where clause:
+  any where true | stats count() by field_name
+  any where <condition> | stats count() by field1, field2
+  any where <condition> | tail 10
+  any where <condition> | head 20
+
+Pipe keywords: stats, count, tail, head, unique, unique_count
+  - stats count() by field       → top N values with counts
+  - count is a function, not a standalone keyword
+
+═══ SEQUENCES ═══
+
+sequence by <shared_field>
+  [any where condition1]
+  [any where condition2]
+
+═══ COMMON MISTAKES TO AVOID ═══
+
+✗ WRONG  any where EventID = 4624          (= is not valid — use ==)
+✓ RIGHT  any where EventID == 4624
+
+✗ WRONG  any where UserName == SYSTEM      (bare word — must quote strings)
+✓ RIGHT  any where UserName == "SYSTEM"
+
+✗ WRONG  any where EventID == "4624"       (numeric field — do not quote numbers)
+✓ RIGHT  any where EventID == 4624
+
+✗ WRONG  any where EventID IN (4624,4625)  (IN must be lowercase: in)
+✓ RIGHT  any where EventID in (4624, 4625)
+
+✗ WRONG  any where NOT UserName == "x"    (NOT must be lowercase: not)
+✓ RIGHT  any where not UserName == "x"
+
+✗ WRONG  any where source.ip exists       (no "exists" keyword in EQL)
+✓ RIGHT  any where source.ip != null
+
+✗ WRONG  count() by field                 (missing "any where true |")
+✓ RIGHT  any where true | stats count() by field
+
+✗ WRONG  any where match_all              (no match_all in EQL)
+✓ RIGHT  any where true
+
+✗ WRONG  any where field like "*"         (wildcard-only match — use != null)
+✓ RIGHT  any where field != null
+
+✗ WRONG  any where @timestamp >= "2024-01-01"   (date range uses between())
+✓ RIGHT  any where @timestamp >= "2024-01-01T00:00:00Z"  (ISO-8601 strings work)
+
+═══ TRANSLATION GUIDE ═══
+
+DSL match_all          → any where true
+DSL exists             → field != null
+DSL term/terms         → == or in ()
+DSL range              → >= / <=  with quoted ISO dates for date fields
+DSL bool.must          → and
+DSL bool.should        → or  (wrap in parentheses if mixed with and)
+DSL bool.must_not      → not
+DSL wildcard query     → like~
+DSL aggs terms         → | stats count() by field
+DSL aggs composite     → | stats count() by field1, field2"""
 
 
 @router.post("/eql")

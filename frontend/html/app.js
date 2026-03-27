@@ -768,7 +768,7 @@ async function handleSubmit(e) {
                   const resp = await fetch('/api/eql', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query_body: q, model: state.model, provider: state.provider }),
+                    body: JSON.stringify({ query_body: q, model: getSelectedModel(), provider: getSelectedProvider() }),
                   });
                   const data = await resp.json();
                   if (data.error) throw new Error(data.error);

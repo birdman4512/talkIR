@@ -263,8 +263,10 @@ services:
       dockerfile: Dockerfile
     volumes:
       - certs:/certs:ro
+      - ./request_logs:/app/request_logs
     networks:
       - internal
+      - public
     environment:
       - ES_HOST=https://elasticsearch:9200
       - ES_USER=elastic

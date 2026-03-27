@@ -5,6 +5,7 @@ import re
 import httpx
 
 from .config import settings
+from .request_log import log_request
 
 _IP_RE = re.compile(
     r'\b(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}'
@@ -18,59 +19,82 @@ MAX_IPS_PER_REQUEST = 15
 
 
 def extract_ips(events: list[dict]) -> list[str]:
-    """Return unique public IPs found in any string field of the events."""
+    """Return unique public IPs found in any field of the events (recurses into nested objects)."""
     seen: set[str] = set()
     result: list[str] = []
-    for event in events:
-        for val in event.values():
-            if not isinstance(val, str):
-                continue
-            for m in _IP_RE.finditer(val):
+
+    def _scan(obj) -> None:
+        if len(result) >= MAX_IPS_PER_REQUEST:
+            return
+        if isinstance(obj, str):
+            for m in _IP_RE.finditer(obj):
                 ip = m.group(0)
                 if ip not in seen and not _PRIVATE.match(ip):
                     seen.add(ip)
                     result.append(ip)
-                    if len(result) >= MAX_IPS_PER_REQUEST:
-                        return result
+        elif isinstance(obj, dict):
+            for val in obj.values():
+                _scan(val)
+        elif isinstance(obj, list):
+            for item in obj:
+                _scan(item)
+
+    for event in events:
+        _scan(event)
     return result
 
 
 async def _lookup_abuseipdb(ip: str) -> dict:
+    url = "https://api.abuseipdb.com/api/v2/check"
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            "https://api.abuseipdb.com/api/v2/check",
-            params={"ipAddress": ip, "maxAgeInDays": 90},
-            headers={"Key": settings.abuseipdb_api_key, "Accept": "application/json"},
-        )
+        try:
+            resp = await client.get(
+                url,
+                params={"ipAddress": ip, "maxAgeInDays": 90},
+                headers={"Key": settings.abuseipdb_api_key, "Accept": "application/json"},
+            )
+        except Exception as exc:
+            log_request(url, ip=ip, source="abuseipdb", error=str(exc))
+            return {}
         if resp.status_code != 200:
+            log_request(url, ip=ip, source="abuseipdb", status_code=resp.status_code, error=resp.text[:200])
             return {}
         d = resp.json().get("data", {})
-        return {
+        result = {
             "score":   d.get("abuseConfidenceScore", 0),
             "reports": d.get("totalReports", 0),
             "country": d.get("countryCode", ""),
             "isp":     d.get("isp", ""),
             "usage":   d.get("usageType", ""),
         }
+        log_request(url, ip=ip, source="abuseipdb", status_code=resp.status_code,
+                    response_summary={"score": result["score"], "country": result["country"], "isp": result["isp"]})
+        return result
 
 
 async def _lookup_virustotal(ip: str) -> dict:
+    url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
-            headers={"x-apikey": settings.virustotal_api_key},
-        )
+        try:
+            resp = await client.get(url, headers={"x-apikey": settings.virustotal_api_key})
+        except Exception as exc:
+            log_request(url, ip=ip, source="virustotal", error=str(exc))
+            return {}
         if resp.status_code != 200:
+            log_request(url, ip=ip, source="virustotal", status_code=resp.status_code, error=resp.text[:200])
             return {}
         attrs = resp.json().get("data", {}).get("attributes", {})
         stats = attrs.get("last_analysis_stats", {})
-        return {
+        result = {
             "malicious":  stats.get("malicious", 0),
             "suspicious": stats.get("suspicious", 0),
             "reputation": attrs.get("reputation", 0),
             "country":    attrs.get("country", ""),
             "as_owner":   attrs.get("as_owner", ""),
         }
+        log_request(url, ip=ip, source="virustotal", status_code=resp.status_code,
+                    response_summary={"malicious": result["malicious"], "country": result["country"], "org": result["as_owner"]})
+        return result
 
 
 async def enrich_ip(ip: str) -> dict:
