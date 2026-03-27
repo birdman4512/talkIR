@@ -12,15 +12,15 @@ router = APIRouter()
 _MODEL_RE = re.compile(r'^[\w][\w.\-:/]{0,99}$')
 
 CATALOGUE = [
-    {"name": "llama3.2:1b",       "size": "1.3 GB", "desc": "Minimal footprint, fast responses",        "low_mem": True},
-    {"name": "deepseek-r1:1.5b",  "size": "1.1 GB", "desc": "Thinking model, low memory",               "low_mem": True},
-    {"name": "llama3.2:3b",       "size": "2.0 GB", "desc": "Fast, basic analysis"},
-    {"name": "mistral:7b",        "size": "4.4 GB", "desc": "Good balance of speed and quality"},
-    {"name": "llama3.1:8b",       "size": "4.9 GB", "desc": "Strong reasoning"},
-    {"name": "qwen2.5:7b",        "size": "4.4 GB", "desc": "Best structured output (lists, tables)"},
-    {"name": "gemma2:9b",         "size": "5.5 GB", "desc": "Strong reasoning, high quality"},
-    {"name": "deepseek-r1:7b",    "size": "4.7 GB", "desc": "Shows reasoning chain (think block)"},
-    {"name": "deepseek-r1:8b",    "size": "4.9 GB", "desc": "Best reasoning with think block"},
+    {"name": "llama3.2:1b",      "size": "1.3 GB", "ram": 1.3, "speed": "fast",   "low_mem": True,  "tags": ["fast"],               "desc": "Minimal footprint — quick triage on memory-constrained systems"},
+    {"name": "deepseek-r1:1.5b", "size": "1.1 GB", "ram": 1.1, "speed": "fast",   "low_mem": True,  "tags": ["thinking", "fast"],    "desc": "Thinking model that fits in low memory — shows reasoning chain"},
+    {"name": "llama3.2:3b",      "size": "2.0 GB", "ram": 2.0, "speed": "fast",   "low_mem": False, "tags": ["fast"],               "desc": "Best default choice — fast responses, reliable query generation"},
+    {"name": "mistral:7b",       "size": "4.4 GB", "ram": 4.4, "speed": "medium", "low_mem": False, "tags": [],                     "desc": "Solid all-rounder, good at following structured instructions"},
+    {"name": "qwen2.5:7b",       "size": "4.4 GB", "ram": 4.4, "speed": "medium", "low_mem": False, "tags": ["structured"],         "desc": "Best for tables, counts, and aggregation queries"},
+    {"name": "llama3.1:8b",      "size": "4.9 GB", "ram": 4.9, "speed": "medium", "low_mem": False, "tags": ["reasoning"],          "desc": "Strong reasoning and multi-step analysis"},
+    {"name": "gemma2:9b",        "size": "5.5 GB", "ram": 5.5, "speed": "slow",   "low_mem": False, "tags": ["reasoning"],          "desc": "High quality output, strong at nuanced security analysis"},
+    {"name": "deepseek-r1:7b",   "size": "4.7 GB", "ram": 4.7, "speed": "slow",   "low_mem": False, "tags": ["thinking"],           "desc": "Full thinking model — shows step-by-step reasoning chain"},
+    {"name": "deepseek-r1:8b",   "size": "4.9 GB", "ram": 4.9, "speed": "slow",   "low_mem": False, "tags": ["thinking"],           "desc": "Best reasoning quality — recommended for complex investigations"},
 ]
 
 

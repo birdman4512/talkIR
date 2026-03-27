@@ -118,6 +118,33 @@
         <button class="btn-icon" id="closeSettings">✕</button>
       </div>
       <div class="settings-body">
+
+        <div class="settings-section">
+          <div class="section-title">// how to choose</div>
+          <div class="model-guide">
+            <div class="guide-row">
+              <span class="guide-key">RAM</span>
+              <span class="guide-val">Each model loads fully into system RAM — the size shown is how much you need free. If you get out-of-memory errors, switch to a <span class="tag-pill low-mem-pill">low mem</span> model or close other applications.</span>
+            </div>
+            <div class="guide-row">
+              <span class="guide-key">speed</span>
+              <span class="guide-val">Smaller models are faster on CPU. <span class="tag-pill fast-pill">fast</span> models respond in seconds; <span class="tag-pill slow-pill">slow</span> models may take a minute per query. Use Claude or OpenAI for fast responses regardless of local RAM.</span>
+            </div>
+            <div class="guide-row">
+              <span class="guide-key">thinking</span>
+              <span class="guide-val"><span class="tag-pill thinking-pill">thinking</span> models show their reasoning chain before answering. Best for complex investigations — lateral movement, privilege escalation, multi-step chains. Significantly slower than standard models.</span>
+            </div>
+            <div class="guide-row">
+              <span class="guide-key">structured</span>
+              <span class="guide-val"><span class="tag-pill structured-pill">structured</span> models produce more reliable tables, lists, and aggregation results. Recommended for "top N", counts, and pivot-style queries.</span>
+            </div>
+            <div class="guide-row">
+              <span class="guide-key">recommended</span>
+              <span class="guide-val"><strong>llama3.2:3b</strong> is the best starting point — fast, fits in 2 GB, handles most queries well. Upgrade to <strong>deepseek-r1:7b</strong> only if you have 5+ GB free and want visible reasoning.</span>
+            </div>
+          </div>
+        </div>
+
         <div class="settings-section">
           <div class="section-title">
             // local models
@@ -127,6 +154,7 @@
             <span class="muted">loading…</span>
           </div>
         </div>
+
       </div>
     </div>
   </div>

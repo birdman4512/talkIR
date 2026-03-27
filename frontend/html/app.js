@@ -236,22 +236,33 @@ async function loadCatalogue() {
     const resp = await fetch('/api/models/catalogue');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const models = await resp.json();
-    catalogueList.innerHTML = models.map(m => `
+    catalogueList.innerHTML = models.map(m => {
+      const allTags = [
+        ...(m.low_mem ? ['low mem'] : []),
+        ...(m.speed   ? [m.speed]   : []),
+        ...(m.tags    || []),
+      ];
+      const tagHtml = allTags.map(t =>
+        `<span class="tag-pill tag-${t.replace(/\s+/g,'-')}">${esc(t)}</span>`
+      ).join('');
+      return `
       <div class="catalogue-row" data-model="${esc(m.name)}">
         <div class="catalogue-info">
-          <span class="catalogue-name">${esc(m.name)}</span>
+          <div class="catalogue-name-row">
+            <span class="catalogue-name">${esc(m.name)}</span>
+            <span class="catalogue-tags">${tagHtml}</span>
+          </div>
           <span class="catalogue-desc muted">${esc(m.desc)}</span>
         </div>
         <div class="catalogue-right">
-          ${m.low_mem ? '<span class="catalogue-badge low-mem" title="Runs on low-memory systems (&lt;2 GB RAM)">low mem</span>' : ''}
           <span class="catalogue-size muted">${esc(m.size)}</span>
           ${m.installed
             ? `<span class="catalogue-badge installed">✓</span>
-               <button class="btn-delete" data-model="${esc(m.name)}" title="Delete model">🗑</button>`
+               <button class="btn-delete" data-model="${esc(m.name)}" title="Delete model">✕</button>`
             : `<button class="btn-pull" data-model="${esc(m.name)}">↓</button>`}
         </div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
 
     catalogueList.querySelectorAll('.btn-pull').forEach(btn => {
       btn.addEventListener('click', () => pullModel(btn.dataset.model, btn));
