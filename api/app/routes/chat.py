@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import httpx
@@ -55,7 +56,10 @@ Example — "users signing in from 1.2.3.4":
 {"query":{"bool":{"must":[{"term":{"IpAddress":"1.2.3.4"}},{"exists":{"field":"UserName"}}]}},"_source":["UserName","IpAddress","@timestamp"],"size":20}
 
 Example — "how often did each user sign in":
-{"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50}}},"size":0}""")
+{"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50}}},"size":0}
+
+Example — "username + source IP + count" (multi-field group-by, use composite):
+{"query":{"match_all":{}},"aggs":{"by_user_ip":{"composite":{"size":100,"sources":[{"user":{"terms":{"field":"UserName"}}},{"ip":{"terms":{"field":"SourceIP"}}}]}}},"size":0}""")
 
 
 def _collect_fields(props: dict, prefix: str, out: list):
@@ -101,12 +105,18 @@ def _sanitize_query_body(body: dict) -> dict:
 
 
 def _extract_hits(result: dict) -> list[dict]:
-    """Extract records from an ES response — handles both hits and aggregation buckets."""
+    """Extract records from an ES response — handles hits, terms aggs, and composite aggs."""
     rows = [h["_source"] for h in result.get("hits", {}).get("hits", [])]
     for agg_name, agg_data in result.get("aggregations", {}).items():
         for bucket in agg_data.get("buckets", []):
-            key = bucket.get("key_as_string") or bucket.get("key")
-            rows.append({agg_name: key, "count": bucket.get("doc_count", 0)})
+            key = bucket.get("key")
+            if isinstance(key, dict):
+                # Composite aggregation — key is a dict of field→value
+                row = dict(key)
+            else:
+                row = {agg_name: bucket.get("key_as_string") or key}
+            row["count"] = bucket.get("doc_count", 0)
+            rows.append(row)
     return rows
 
 
@@ -120,19 +130,41 @@ def _extract_json(text: str) -> dict | None:
         pass
     # Strip markdown code fences — greedy so nested braces are captured whole
     match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', text, re.DOTALL)
-    if match:
+    candidate = match.group(1) if match else None
+    if candidate is None:
+        # Find outermost JSON object
+        m2 = re.search(r'\{.*\}', text, re.DOTALL)
+        candidate = m2.group(0) if m2 else None
+    if candidate:
         try:
-            return json.loads(match.group(1))
+            return json.loads(candidate)
         except json.JSONDecodeError:
             pass
-    # Find outermost JSON object
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+        # Repair: LLMs sometimes omit closing brackets — append what's missing
+        repaired = _repair_json(candidate)
+        if repaired is not None:
+            return repaired
     return None
+
+
+def _repair_json(text: str) -> dict | None:
+    """Append missing closing brackets/braces and retry parse."""
+    missing_brackets = text.count('[') - text.count(']')
+    missing_braces   = text.count('{') - text.count('}')
+    if missing_brackets <= 0 and missing_braces <= 0:
+        return None
+    # Insert missing ']' before the trailing '}' cluster so array closes first
+    repaired = text.rstrip()
+    trailing = ''
+    while repaired.endswith('}') and missing_brackets > 0:
+        trailing = '}' + trailing
+        repaired  = repaired[:-1]
+    repaired += ']' * missing_brackets + trailing
+    repaired += '}' * missing_braces
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
 
 
 async def _llm_complete(provider: str, model: str, system: str, user: str) -> str:
@@ -306,26 +338,44 @@ async def _smart_search(
     target = ",".join(indices[:20]) if indices else "_all"
 
     if "queries" in parsed:
-        # ── Multiple queries ────────────────────────────────────────────────────
+        # ── Multiple queries — run in parallel ──────────────────────────────────
         raw_queries = parsed["queries"]
         if not isinstance(raw_queries, list) or not raw_queries:
             events = await _keyword_search(indices, query, max_results)
             yield ("result", events, None, "LLM returned empty queries list — fell back to keyword search.")
             return
 
-        per_query = max(1, max_results // min(len(raw_queries), 3))
+        valid_raw = [qb for qb in raw_queries[:3] if isinstance(qb, dict) and "query" in qb]
+        if not valid_raw:
+            events = await _keyword_search(indices, query, max_results)
+            yield ("result", events, None, "No valid query objects in LLM response — fell back to keyword search.")
+            return
+
+        per_query = max(1, max_results // len(valid_raw))
+        total = len(valid_raw)
         all_events: list[dict] = []
         valid_bodies: list[dict] = []
         errors: list[str] = []
 
-        for qb in raw_queries[:3]:
-            if not isinstance(qb, dict) or "query" not in qb:
-                continue
-            try:
-                all_events.extend(await _run_query(es, target, qb, per_query))
-                valid_bodies.append(qb)
-            except Exception as exc:
-                errors.append(str(exc))
+        # Launch all ES queries concurrently, yield progress as each completes
+        tasks = {asyncio.create_task(_run_query(es, target, qb, per_query)): qb
+                 for qb in valid_raw}
+        pending = set(tasks)
+        completed = 0
+
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                qb = tasks[task]
+                completed += 1
+                try:
+                    hits = task.result()
+                    all_events.extend(hits)
+                    valid_bodies.append(qb)
+                    yield ("query_progress", completed, total, len(hits))
+                except Exception as exc:
+                    errors.append(str(exc))
+                    yield ("query_progress", completed, total, 0)
 
         if not valid_bodies:
             events = await _keyword_search(indices, query, max_results)
@@ -619,6 +669,9 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                 async for item in _smart_search(provider, model, indices, req.query, req.max_results):
                     if item[0] == "query_thinking":
                         yield f"data: {json.dumps({'query_thinking': item[1]})}\n\n"
+                    elif item[0] == "query_progress":
+                        _, done, total, count = item
+                        yield f"data: {json.dumps({'query_progress': {'done': done, 'total': total, 'count': count}})}\n\n"
                     elif item[0] == "result":
                         events, query_body, fallback_reason = item[1], item[2], item[3]
             except httpx.TimeoutException:

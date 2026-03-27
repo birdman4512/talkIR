@@ -534,6 +534,12 @@ async function handleSubmit(e) {
             _updateThinking();
           }
 
+          if (chunk.query_progress) {
+            const { done, total, count } = chunk.query_progress;
+            _thinkingBase = `[*] running queries… ${done}/${total} done (+${count} records)`;
+            _updateThinking();
+          }
+
           if (chunk.query_thinking) {
             if (qThinkDetails.hidden) {
               qThinkDetails.hidden = false;
