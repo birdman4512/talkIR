@@ -101,6 +101,22 @@ def _sanitize_query_body(body: dict) -> dict:
         elif "match_all" in q and q["match_all"]:
             # match_all must be empty — LLM sometimes puts fields inside it
             body["query"]["match_all"] = {}
+
+    # Fix composite sources that are strings instead of source-objects
+    # e.g. "sources": ["UserName"] → "sources": [{"UserName": {"terms": {"field": "UserName"}}}]
+    aggs = body.get("aggs", body.get("aggregations", {}))
+    for agg_def in aggs.values():
+        composite = agg_def.get("composite", {})
+        sources = composite.get("sources")
+        if isinstance(sources, list):
+            fixed = []
+            for src in sources:
+                if isinstance(src, str):
+                    fixed.append({src: {"terms": {"field": src}}})
+                elif isinstance(src, dict):
+                    fixed.append(src)
+            composite["sources"] = fixed
+
     return body
 
 
@@ -374,7 +390,7 @@ async def _smart_search(
                     valid_bodies.append(qb)
                     yield ("query_progress", completed, total, len(hits))
                 except Exception as exc:
-                    errors.append(str(exc))
+                    errors.append(f"{exc} | query: {json.dumps(qb, separators=(',', ':'))[:300]}")
                     yield ("query_progress", completed, total, 0)
 
         if not valid_bodies:
@@ -401,7 +417,7 @@ async def _smart_search(
             yield ("result", events, parsed, None)
         except Exception as exc:
             events = await _keyword_search(indices, query, max_results)
-            yield ("result", events, parsed, f"Generated query failed ({exc}) — fell back to keyword search.")
+            yield ("result", events, parsed, f"Generated query failed ({exc}) — fell back to keyword search.\n\nFailing query: {json.dumps(parsed, separators=(',', ':'))[:400]}")
 
 
 async def _keyword_search(indices: list[str], query: str, max_results: int) -> list[dict]:
@@ -439,12 +455,28 @@ async def _keyword_search(indices: list[str], query: str, max_results: int) -> l
         return []
 
 
+_MAX_CONTEXT_CHARS = 24_000  # ~6 000 tokens — leave headroom for system prompt + reply
+
+
 def _build_context_block(events: list[dict]) -> str:
     if not events:
         return "\n\n[No matching log events found in Elasticsearch for this query.]\n"
     lines = [f"\n\n--- {len(events)} log event(s) retrieved from Elasticsearch ---\n"]
+    used = len(lines[0])
+    included = 0
     for i, event in enumerate(events, 1):
-        lines.append(f"\n[Event {i}]\n{json.dumps(event, indent=2)}\n")
+        # Compact JSON; truncate any single value that is excessively long
+        compact = {
+            k: (v[:300] + "…" if isinstance(v, str) and len(v) > 300 else v)
+            for k, v in event.items()
+        }
+        entry = f"\n[Event {i}] {json.dumps(compact, separators=(',', ':'))}\n"
+        if used + len(entry) > _MAX_CONTEXT_CHARS:
+            lines.append(f"\n[…{len(events) - included} more event(s) omitted — reduce result count or narrow your query]\n")
+            break
+        lines.append(entry)
+        used += len(entry)
+        included += 1
     return "".join(lines)
 
 
