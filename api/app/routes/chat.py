@@ -46,6 +46,7 @@ Rules:
 
 For questions requiring different event types (e.g. lateral movement needs auth events AND process events), return multiple queries:
 {"queries":[{"query":{...},"size":N},{"query":{...},"aggs":{...},"size":0}]}
+IMPORTANT: every key ("query","aggs","size","_source") must be INSIDE a query object in the array. Never place keys outside the array elements.
 Use at most 3 queries. Prefer a single query unless multiple are clearly needed.
 
 Fields ($indices): $fields
@@ -117,8 +118,8 @@ def _extract_json(text: str) -> dict | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Strip markdown code fences
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    # Strip markdown code fences — greedy so nested braces are captured whole
+    match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
@@ -183,6 +184,80 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
             return data.get("message", {}).get("content", "")
 
 
+async def _stream_query_gen_ollama(model: str, system: str, user: str):
+    """Stream Ollama query generation, yielding ('thinking', text) or ('content', text) tuples."""
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            f"{settings.ollama_host}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "stream": True,
+                "think": True,
+            },
+        ) as response:
+            if response.status_code != 200:
+                return
+
+            in_think = False
+            buf = ""
+
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if "error" in chunk:
+                    return
+
+                native_think = chunk.get("message", {}).get("thinking", "")
+                if native_think:
+                    yield ("thinking", native_think)
+
+                content = chunk.get("message", {}).get("content", "")
+                if content:
+                    buf += content
+                    while buf:
+                        if not in_think:
+                            idx = buf.find("<think>")
+                            if idx == -1:
+                                hold = _partial_tag_suffix(buf, "<think>")
+                                emit, buf = buf[: len(buf) - len(hold)], hold
+                                if emit:
+                                    yield ("content", emit)
+                                break
+                            else:
+                                if idx > 0:
+                                    yield ("content", buf[:idx])
+                                buf = buf[idx + len("<think>"):]
+                                in_think = True
+                        else:
+                            idx = buf.find("</think>")
+                            if idx == -1:
+                                hold = _partial_tag_suffix(buf, "</think>")
+                                emit, buf = buf[: len(buf) - len(hold)], hold
+                                if emit:
+                                    yield ("thinking", emit)
+                                break
+                            else:
+                                if idx > 0:
+                                    yield ("thinking", buf[:idx])
+                                buf = buf[idx + len("</think>"):]
+                                in_think = False
+
+                if chunk.get("done"):
+                    if buf:
+                        yield ("thinking" if in_think else "content", buf)
+                    break
+
+
 async def _run_query(es, target: str, query_body: dict, size_cap: int) -> list[dict]:
     """Run a single ES query body and return extracted records."""
     query_body["size"] = min(query_body.get("size", size_cap), size_cap)
@@ -193,10 +268,10 @@ async def _run_query(es, target: str, query_body: dict, size_cap: int) -> list[d
 
 async def _smart_search(
     provider: str, model: str, indices: list[str], query: str, max_results: int
-) -> tuple[list[dict], dict | list | None, str | None]:
+):
     """
-    Use the LLM to generate one or more ES queries, run them, and return
-    (events, query_body_or_list, fallback_reason).
+    Async generator: yields ('query_thinking', text) while the LLM reasons about the query,
+    then yields ('result', events, query_body_or_list, fallback_reason) once done.
     """
     es = get_es_client()
 
@@ -208,13 +283,25 @@ async def _smart_search(
         fields=fields_str,
     )
 
-    raw = await _llm_complete(provider, model, system, query)
+    # Generate query — stream for Ollama to surface thinking, batch for others
+    if provider == "ollama":
+        content_parts: list[str] = []
+        async for kind, text in _stream_query_gen_ollama(model, system, query):
+            if kind == "thinking":
+                yield ("query_thinking", text)
+            else:
+                content_parts.append(text)
+        raw = "".join(content_parts)
+    else:
+        raw = await _llm_complete(provider, model, system, query)
+
     parsed = _extract_json(raw)
 
     if not parsed or ("query" not in parsed and "queries" not in parsed):
         events = await _keyword_search(indices, query, max_results)
         detail = raw[:500] if raw.strip() else "(model returned no output — possible OOM or context overflow)"
-        return events, None, f"LLM did not return valid query JSON — fell back to keyword search.\n\nLLM output:\n{detail}"
+        yield ("result", events, None, f"LLM did not return valid query JSON — fell back to keyword search.\n\nLLM output:\n{detail}")
+        return
 
     target = ",".join(indices[:20]) if indices else "_all"
 
@@ -223,7 +310,8 @@ async def _smart_search(
         raw_queries = parsed["queries"]
         if not isinstance(raw_queries, list) or not raw_queries:
             events = await _keyword_search(indices, query, max_results)
-            return events, None, "LLM returned empty queries list — fell back to keyword search."
+            yield ("result", events, None, "LLM returned empty queries list — fell back to keyword search.")
+            return
 
         per_query = max(1, max_results // min(len(raw_queries), 3))
         all_events: list[dict] = []
@@ -241,7 +329,8 @@ async def _smart_search(
 
         if not valid_bodies:
             events = await _keyword_search(indices, query, max_results)
-            return events, None, f"All generated queries failed — fell back to keyword search. {'; '.join(errors)}"
+            yield ("result", events, None, f"All generated queries failed — fell back to keyword search. {'; '.join(errors)}")
+            return
 
         # Deduplicate preserving insertion order
         seen: set[str] = set()
@@ -253,16 +342,16 @@ async def _smart_search(
                 deduped.append(e)
 
         fallback = f"Some queries failed: {'; '.join(errors)}" if errors else None
-        return deduped[:max_results], valid_bodies, fallback
+        yield ("result", deduped[:max_results], valid_bodies, fallback)
 
     else:
         # ── Single query ────────────────────────────────────────────────────────
         try:
             events = await _run_query(es, target, parsed, max_results)
-            return events, parsed, None
+            yield ("result", events, parsed, None)
         except Exception as exc:
             events = await _keyword_search(indices, query, max_results)
-            return events, parsed, f"Generated query failed ({exc}) — fell back to keyword search."
+            yield ("result", events, parsed, f"Generated query failed ({exc}) — fell back to keyword search.")
 
 
 async def _keyword_search(indices: list[str], query: str, max_results: int) -> list[dict]:
@@ -524,9 +613,14 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
             yield f"data: {json.dumps({'status': 'generating_query'})}\n\n"
 
             try:
-                events, query_body, fallback_reason = await _smart_search(
-                    provider, model, indices, req.query, req.max_results
-                )
+                events: list[dict] = []
+                query_body = None
+                fallback_reason = None
+                async for item in _smart_search(provider, model, indices, req.query, req.max_results):
+                    if item[0] == "query_thinking":
+                        yield f"data: {json.dumps({'query_thinking': item[1]})}\n\n"
+                    elif item[0] == "result":
+                        events, query_body, fallback_reason = item[1], item[2], item[3]
             except httpx.TimeoutException:
                 yield f"data: {json.dumps({'error': 'Query generation timed out — try a faster model or disable smart query'})}\n\n"
                 return

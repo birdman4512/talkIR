@@ -381,6 +381,18 @@ async function handleSubmit(e) {
   contextMsg.hidden = true;
   messagesEl.appendChild(contextMsg);
 
+  // Query reasoning block (hidden until query_thinking arrives)
+  const qThinkDetails = document.createElement('details');
+  qThinkDetails.className = 'think-block';
+  qThinkDetails.hidden = true;
+  const qThinkSummary = document.createElement('summary');
+  qThinkSummary.textContent = '// query reasoning...';
+  qThinkDetails.appendChild(qThinkSummary);
+  const qThinkBody = document.createElement('div');
+  qThinkBody.className = 'think-body';
+  qThinkDetails.appendChild(qThinkBody);
+  contextMsg.appendChild(qThinkDetails);
+
   // Query blocks are created dynamically when generated_query arrives
 
   // Records — collapsed by default
@@ -427,11 +439,14 @@ async function handleSubmit(e) {
   liveStats.hidden = true;
   msgEl.appendChild(liveStats);
 
-  let genStart     = 0;
-  let statsTimer   = null;
-  let thinkStart   = 0;
-  let thinkTimer   = null;
-  let thinkChars   = 0;
+  let genStart       = 0;
+  let statsTimer     = null;
+  let thinkStart     = 0;
+  let thinkTimer     = null;
+  let thinkChars     = 0;
+  let qThinkStart    = 0;
+  let qThinkTimer    = null;
+  let qThinkChars    = 0;
 
   function startGenStats() {
     genStart = Date.now();
@@ -519,7 +534,34 @@ async function handleSubmit(e) {
             _updateThinking();
           }
 
+          if (chunk.query_thinking) {
+            if (qThinkDetails.hidden) {
+              qThinkDetails.hidden = false;
+              qThinkDetails.open = true;
+              qThinkDetails.classList.add('active');
+              contextMsg.hidden = false;
+              qThinkStart = Date.now();
+              qThinkTimer = setInterval(() => {
+                const s = ((Date.now() - qThinkStart) / 1000).toFixed(1);
+                qThinkSummary.textContent = `// query reasoning... (${s}s)`;
+              }, 100);
+            }
+            qThinkChars += chunk.query_thinking.length;
+            qThinkBody.textContent += chunk.query_thinking;
+            qThinkBody.scrollTop = qThinkBody.scrollHeight;
+            scrollToBottom();
+          }
+
           if (chunk.generated_query) {
+            // Seal the query reasoning block
+            if (!qThinkDetails.hidden && qThinkTimer) {
+              clearInterval(qThinkTimer);
+              qThinkTimer = null;
+              qThinkDetails.classList.remove('active');
+              qThinkDetails.open = false;
+              const s = ((Date.now() - qThinkStart) / 1000).toFixed(1);
+              qThinkSummary.textContent = `// query reasoning (${s}s · ${qThinkChars.toLocaleString()} chars)`;
+            }
             const queries = Array.isArray(chunk.generated_query)
               ? chunk.generated_query
               : [chunk.generated_query];
@@ -588,12 +630,11 @@ async function handleSubmit(e) {
               statusBubble.hidden = true;
               assistantBubble.hidden = false;
               startGenStats();
-              // Seal the thinking block
+              // Seal the thinking block — keep it open so user can read it
               if (!thinkDetails.hidden) {
                 clearInterval(thinkTimer);
                 thinkTimer = null;
                 thinkDetails.classList.remove('active');
-                thinkDetails.open = false;
                 const s = ((Date.now() - thinkStart) / 1000).toFixed(1);
                 thinkSummary.textContent = `// reasoning (${s}s · ${thinkChars.toLocaleString()} chars)`;
               }
@@ -628,6 +669,7 @@ async function handleSubmit(e) {
     stopThinkingTimer();
     clearInterval(statsTimer);
     clearInterval(thinkTimer);
+    clearInterval(qThinkTimer);
     setStreaming(false);
   }
 }
