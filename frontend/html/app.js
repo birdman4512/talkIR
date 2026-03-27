@@ -20,6 +20,7 @@ const allResultsCb    = document.getElementById('allResults');
 const smartQueryCb    = document.getElementById('smartQuery');
 const conciseModeCb   = document.getElementById('conciseMode');
 const threatIntelCb   = document.getElementById('threatIntel');
+const personaSelect   = document.getElementById('personaSelect');
 const refreshBtn      = document.getElementById('refreshIndices');
 const clearBtn        = document.getElementById('clearChat');
 const modelBadge      = document.getElementById('modelBadge');
@@ -560,6 +561,7 @@ async function handleSubmit(e) {
         provider,
         smart_query: smartQueryCb.checked,
         threat_intel: threatIntelCb.checked,
+        persona: personaSelect.value || 'security',
       }),
     });
 

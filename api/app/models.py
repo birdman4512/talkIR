@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     provider: str = "ollama"  # ollama | claude | openai
     smart_query: bool = False
     threat_intel: bool = False
+    persona: str = "security"
 
 
 class IndexInfo(BaseModel):

@@ -13,7 +13,10 @@ from ..config import settings
 
 router = APIRouter()
 
-SYSTEM_PROMPT = """You are an expert cybersecurity analyst and threat hunter with deep knowledge of:
+PERSONAS: dict[str, dict] = {
+    "security": {
+        "label": "Cybersecurity Analyst",
+        "prompt": """You are an expert cybersecurity analyst and threat hunter with deep knowledge of:
 - SIEM log analysis, anomaly detection, and behavioural baselining
 - Attack patterns and TTPs mapped to the MITRE ATT&CK framework
 - Common log formats: Windows Event Logs, Syslog, CEF, LEEF, JSON security events
@@ -29,7 +32,43 @@ When analysing security events:
 5. Recommend concrete next steps for investigation or remediation
 6. If the data is insufficient to draw a conclusion, say so clearly
 
-You will be given raw log events retrieved from Elasticsearch. Analyse them carefully and answer the user's question."""
+You will be given raw log events retrieved from Elasticsearch. Analyse them carefully and answer the user's question.""",
+    },
+    "analyst": {
+        "label": "Data Analyst",
+        "prompt": """You are an expert data analyst. When analysing data:
+1. Lead with key patterns, trends, and anomalies
+2. Provide quantitative insights — counts, percentages, averages, rates of change
+3. Highlight outliers and unexpected values
+4. Flag data quality issues such as missing fields, inconsistencies, or duplicates
+5. Use clear structured output — tables and bullet points where they aid clarity
+6. Distinguish correlation from causation
+7. Suggest follow-up questions that would add value to the analysis
+
+You will be given raw records retrieved from Elasticsearch. Analyse them and answer the user's question accurately.""",
+    },
+    "devops": {
+        "label": "DevOps / SRE",
+        "prompt": """You are an expert DevOps engineer and Site Reliability Engineer. When analysing application and infrastructure logs:
+1. Lead with service health: errors, latency spikes, resource exhaustion, crash loops
+2. Identify error patterns — repeated exceptions, failure cascades, timeouts, OOM kills
+3. Map issues to likely root causes: deploys, config changes, traffic spikes, dependency failures
+4. Quantify impact — error rate, affected percentage of requests, duration of degradation
+5. Recommend immediate mitigations and longer-term fixes
+6. Distinguish urgent signals from background noise
+
+You will be given raw log records from Elasticsearch. Analyse them and answer the user's question.""",
+    },
+    "general": {
+        "label": "General Assistant",
+        "prompt": """You are a helpful assistant that answers questions about data. Be accurate, concise, and factual. Base your answers only on the data provided. If the data is insufficient to answer a question, say so clearly rather than speculating. Use tables and lists where they aid clarity.
+
+You will be given raw records retrieved from Elasticsearch. Answer the user's question based on those records.""",
+    },
+}
+
+# Default persona used when none is specified
+_DEFAULT_PERSONA = "security"
 
 QUERY_GEN_PROMPT = Template("""Generate an Elasticsearch Query DSL JSON body for this security log query.
 
@@ -37,7 +76,7 @@ Output ONLY a valid JSON object — no markdown, no explanation.
 
 Rules:
 - Must have a "query" key. Max size: $max_results.
-- Use only exact field names from the list below. No wildcards as field names.
+- Use ONLY the exact field names listed below. No wildcards as field names.
 - No join queries (has_child, has_parent, nested) — documents are flat.
 - The "query" value must contain EXACTLY ONE top-level key (e.g. "bool", "match", "term", "exists"). NEVER put two query types as sibling keys.
 - To combine conditions use bool.must / bool.should / bool.filter arrays.
@@ -46,12 +85,22 @@ Rules:
 - NEVER use term to match a field name against itself (e.g. term:{IpAddress:"IpAddress"} is wrong). term matches a specific value.
 - Do not invent specific values unless the user names them.
 
+Field type guide (use this to choose the right query clause):
+- (keyword)   → exact match with term/terms, use directly in aggs
+- (text+kw)   → full-text search with match; for exact match or aggs use field.keyword
+- (text)       → full-text search with match only; cannot use for term or aggs
+- (date)       → range queries with gte/lte; ISO-8601 or epoch_millis
+- (ip)         → term or range; use CIDR notation for subnets
+- (long/integer/float) → numeric range or term
+- (boolean)    → term with true/false
+
 For questions requiring different event types (e.g. lateral movement needs auth events AND process events), return multiple queries:
 {"queries":[{"query":{...},"size":N},{"query":{...},"aggs":{...},"size":0}]}
 IMPORTANT: every key ("query","aggs","size","_source") must be INSIDE a query object in the array. Never place keys outside the array elements.
 Use at most 3 queries. Prefer a single query unless multiple are clearly needed.
 
-Fields ($indices): $fields
+Available fields in ($indices):
+$fields
 
 Example — "list all IP addresses" (exists — returns records that have the field):
 {"query":{"exists":{"field":"IpAddress"}},"_source":["IpAddress","@timestamp"],"size":20}
@@ -59,41 +108,59 @@ Example — "list all IP addresses" (exists — returns records that have the fi
 Example — "users signing in from 1.2.3.4" (term — matches a specific known value):
 {"query":{"bool":{"must":[{"term":{"IpAddress":"1.2.3.4"}},{"exists":{"field":"UserName"}}]}},"_source":["UserName","IpAddress","@timestamp"],"size":20}
 
-Example — "how often did each user sign in":
+Example — "how often did each user sign in" (keyword field → terms agg):
 {"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50}}},"size":0}
 
 Example — "username + source IP + count, ordered by count" (nested terms agg):
 {"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50,"order":{"_count":"desc"}},"aggs":{"by_ip":{"terms":{"field":"SourceIP","size":10}}}}},"size":0}
 
-Example — "username + source IP + count" (composite agg, use when order matters across both fields):
-{"query":{"match_all":{}},"aggs":{"by_user_ip":{"composite":{"size":100,"sources":[{"user":{"terms":{"field":"UserName"}}},{"ip":{"terms":{"field":"SourceIP"}}}]}}},"size":0}""")
+Example — "username + source IP + count" (composite agg):
+{"query":{"match_all":{}},"aggs":{"by_user_ip":{"composite":{"size":100,"sources":[{"user":{"terms":{"field":"UserName"}}},{"ip":{"terms":{"field":"SourceIP"}}}]}}},"size":0}
+
+Example — "events in the last 24 hours" (date range):
+{"query":{"range":{"@timestamp":{"gte":"now-24h","lte":"now"}}},"size":20}""")
 
 
-def _collect_fields(props: dict, prefix: str, out: list):
+def _collect_fields(props: dict, prefix: str, out: list[tuple[str, str]]):
+    """Recursively collect (field_path, type_hint) tuples from an ES mapping properties dict."""
     for name, data in props.items():
         full = f"{prefix}.{name}" if prefix else name
-        out.append(full)
+        ftype = data.get("type", "object")
+        # For text fields, note if a .keyword sub-field exists for aggregations
+        if ftype == "text":
+            has_keyword = "keyword" in data.get("fields", {})
+            hint = "text+kw" if has_keyword else "text"
+        elif ftype == "object" and "properties" in data:
+            # Don't emit object nodes — recurse into children instead
+            _collect_fields(data["properties"], full, out)
+            continue
+        else:
+            hint = ftype  # keyword, date, ip, long, integer, float, boolean, …
+        out.append((full, hint))
         if "properties" in data:
             _collect_fields(data["properties"], full, out)
 
 
 async def _get_mapping_fields(es, indices: list[str]) -> str:
-    """Return a compact comma-separated list of actual field names from ES mappings."""
+    """Return a structured field list with type hints for the query-gen prompt."""
     try:
         target = ",".join(indices[:5]) if indices else "_all"
         mapping = await es.indices.get_mapping(index=target)
-        fields: list[str] = []
+        fields: list[tuple[str, str]] = []
         for idx_data in mapping.values():
             props = idx_data.get("mappings", {}).get("properties", {})
             _collect_fields(props, "", fields)
-        # Deduplicate and cap
+        # Deduplicate by field name, preserving first occurrence
         seen: set[str] = set()
-        unique = []
-        for f in fields:
-            if f not in seen:
-                seen.add(f)
-                unique.append(f)
-        return ", ".join(unique[:30]) if unique else "(unavailable)"
+        unique: list[tuple[str, str]] = []
+        for name, hint in fields:
+            if name not in seen:
+                seen.add(name)
+                unique.append((name, hint))
+        if not unique:
+            return "(unavailable)"
+        # Format: "FieldName (type)" — cap at 60 fields to stay within prompt budget
+        return ", ".join(f"{n} ({h})" for n, h in unique[:60])
     except Exception:
         return "(unavailable)"
 
@@ -748,6 +815,11 @@ async def _stream_openai(model: str, messages: list[dict]):
                         yield ("content", text, False, {})
 
 
+@router.get("/personas")
+async def list_personas(_: dict = Depends(require_auth)):
+    return [{"id": k, "label": v["label"]} for k, v in PERSONAS.items()]
+
+
 @router.post("/chat")
 async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     provider = req.provider or "ollama"
@@ -831,7 +903,8 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         # ── Phase 2: analyse with LLM ───────────────────────────────────────────
         context_block = _build_context_block(events) + enrichment_context
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        persona_prompt = PERSONAS.get(req.persona or _DEFAULT_PERSONA, PERSONAS[_DEFAULT_PERSONA])["prompt"]
+        messages: list[dict] = [{"role": "system", "content": persona_prompt}]
         if req.conversation_history:
             messages.extend(m.model_dump() for m in req.conversation_history[-20:])
         messages.append({"role": "user", "content": req.query + context_block})
