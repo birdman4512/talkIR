@@ -124,38 +124,74 @@ selectAllCb.addEventListener('change', toggleSelectAll);
 chatForm.addEventListener('submit', handleSubmit);
 
 // ─── Indices ──────────────────────────────────────────────────────────────────
+const indicesFilterInput = document.getElementById('indicesFilter');
+let _allIndices = [];
+const _selectedIndices = new Set();
+
 async function loadIndices() {
   indicesList.innerHTML = '<span class="muted">Loading…</span>';
   try {
     const resp = await fetch('/api/indices');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const indices = await resp.json();
-
-    if (indices.length === 0) {
-      indicesList.innerHTML = '<span class="muted">No indices yet — drop .json files into ./logs/</span>';
-      return;
-    }
-
-    indicesList.innerHTML = indices.map(idx => `
-      <label class="check-label">
-        <input type="checkbox" class="index-cb" value="${esc(idx.name)}" checked />
-        ${esc(idx.name)}
-        <span class="index-meta">${idx.doc_count.toLocaleString()} docs</span>
-      </label>
-    `).join('');
+    _allIndices = await resp.json();
+    _renderIndices();
   } catch (err) {
     indicesList.innerHTML = `<span class="muted">Error: ${esc(String(err))}</span>`;
   }
 }
 
+function _renderIndices() {
+  // Sync checked state from DOM before re-rendering
+  document.querySelectorAll('.index-cb').forEach(cb => {
+    if (cb.checked) _selectedIndices.add(cb.value);
+    else _selectedIndices.delete(cb.value);
+  });
+
+  const term = indicesFilterInput.value.trim().toLowerCase();
+  const visible = term ? _allIndices.filter(idx => idx.name.toLowerCase().includes(term)) : _allIndices;
+
+  if (_allIndices.length === 0) {
+    indicesList.innerHTML = '<span class="muted">No indices yet — drop .json files into ./logs/</span>';
+    return;
+  }
+  if (visible.length === 0) {
+    indicesList.innerHTML = '<span class="muted">No matches</span>';
+    return;
+  }
+
+  indicesList.innerHTML = visible.map(idx => `
+    <label class="check-label">
+      <input type="checkbox" class="index-cb" value="${esc(idx.name)}"${_selectedIndices.has(idx.name) ? ' checked' : ''} />
+      ${esc(idx.name)}
+      <span class="index-meta">${idx.doc_count.toLocaleString()} docs</span>
+    </label>
+  `).join('');
+}
+
+indicesFilterInput.addEventListener('input', _renderIndices);
+
 function getSelectedIndices() {
-  return [...document.querySelectorAll('.index-cb:checked')].map(cb => cb.value);
+  // Sync from DOM then return current selection
+  document.querySelectorAll('.index-cb').forEach(cb => {
+    if (cb.checked) _selectedIndices.add(cb.value);
+    else _selectedIndices.delete(cb.value);
+  });
+  return [..._selectedIndices];
 }
 
 function toggleSelectAll() {
+  const checked = selectAllCb.checked;
   document.querySelectorAll('.index-cb').forEach(cb => {
-    cb.checked = selectAllCb.checked;
+    cb.checked = checked;
+    if (checked) _selectedIndices.add(cb.value);
+    else _selectedIndices.delete(cb.value);
   });
+  // Also apply to indices not currently visible in the filtered list
+  if (!checked) {
+    _selectedIndices.clear();
+  } else {
+    _allIndices.forEach(idx => _selectedIndices.add(idx.name));
+  }
 }
 
 // ─── Model info ───────────────────────────────────────────────────────────────
@@ -471,6 +507,18 @@ async function handleSubmit(e) {
   contextDetails.appendChild(contextBody);
   contextMsg.appendChild(contextDetails);
 
+  // Full prompt debug block (shown only when debug mode is on)
+  const debugDetails = document.createElement('details');
+  debugDetails.className = 'think-block debug-block';
+  debugDetails.hidden = true;
+  const debugSummary = document.createElement('summary');
+  debugSummary.textContent = '// full prompts sent to LLM';
+  debugDetails.appendChild(debugSummary);
+  const debugBody = document.createElement('div');
+  debugBody.className = 'think-body';
+  debugDetails.appendChild(debugBody);
+  contextMsg.appendChild(debugDetails);
+
   // Assistant message wrapper
   const msgEl = document.createElement('div');
   msgEl.className = 'msg assistant';
@@ -694,6 +742,59 @@ async function handleSubmit(e) {
               qCode.textContent = JSON.stringify(q, null, 2);
               qBlock.appendChild(qSummary);
               qBlock.appendChild(qCode);
+
+              // Query action buttons
+              const qActions = document.createElement('div');
+              qActions.className = 'query-actions';
+
+              const copyBtn = document.createElement('button');
+              copyBtn.className = 'btn-query-action';
+              copyBtn.textContent = '[ copy ]';
+              copyBtn.addEventListener('click', async () => {
+                try {
+                  await navigator.clipboard.writeText(qCode.textContent);
+                  copyBtn.textContent = '[ copied ]';
+                  setTimeout(() => { copyBtn.textContent = '[ copy ]'; }, 1500);
+                } catch { copyBtn.textContent = '[ failed ]'; setTimeout(() => { copyBtn.textContent = '[ copy ]'; }, 1500); }
+              });
+
+              const eqlBtn = document.createElement('button');
+              eqlBtn.className = 'btn-query-action';
+              eqlBtn.textContent = '[ eql ]';
+              eqlBtn.addEventListener('click', async () => {
+                eqlBtn.textContent = '[ converting… ]';
+                eqlBtn.disabled = true;
+                try {
+                  const resp = await fetch('/api/eql', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+                    body: JSON.stringify({ query_body: q, model: state.model, provider: state.provider }),
+                  });
+                  const data = await resp.json();
+                  if (data.error) throw new Error(data.error);
+                  const eqlPre = document.createElement('pre');
+                  eqlPre.className = 'query-code eql-result';
+                  eqlPre.textContent = data.eql;
+                  const eqlLabel = document.createElement('div');
+                  eqlLabel.className = 'eql-label';
+                  eqlLabel.textContent = 'EQL equivalent:';
+                  const existing = qBlock.querySelector('.eql-result');
+                  if (existing) { existing.previousSibling?.remove(); existing.remove(); }
+                  qBlock.appendChild(eqlLabel);
+                  qBlock.appendChild(eqlPre);
+                  qBlock.open = true;
+                  eqlBtn.textContent = '[ eql ]';
+                  scrollToBottom();
+                } catch (err) {
+                  eqlBtn.textContent = '[ eql error ]';
+                  setTimeout(() => { eqlBtn.textContent = '[ eql ]'; }, 2000);
+                }
+                eqlBtn.disabled = false;
+              });
+
+              qActions.appendChild(copyBtn);
+              qActions.appendChild(eqlBtn);
+              qBlock.appendChild(qActions);
               contextMsg.appendChild(qBlock);
             });
             contextMsg.hidden = false;
@@ -706,6 +807,31 @@ async function handleSubmit(e) {
             warn.textContent = chunk.query_warning;
             contextMsg.appendChild(warn);
             contextMsg.hidden = false;
+            scrollToBottom();
+          }
+
+          if (chunk.debug_query_prompt && document.getElementById('debugMode').checked) {
+            debugDetails.hidden = false;
+            contextMsg.hidden = false;
+            const hdr = document.createElement('pre');
+            hdr.className = 'query-code';
+            hdr.textContent = '══ PHASE 1: QUERY GENERATION ══\n\n=== SYSTEM PROMPT ===\n' + chunk.debug_query_prompt.system +
+              '\n\n=== USER QUESTION ===\n' + chunk.debug_query_prompt.user;
+            debugBody.appendChild(hdr);
+            scrollToBottom();
+          }
+
+          if (chunk.debug_prompt && document.getElementById('debugMode').checked) {
+            debugDetails.hidden = false;
+            contextMsg.hidden = false;
+            const sysPre = document.createElement('pre');
+            sysPre.className = 'query-code';
+            sysPre.textContent = '══ PHASE 2: ANALYSIS ══\n\n=== SYSTEM PROMPT ===\n' + chunk.debug_prompt.system;
+            const userPre = document.createElement('pre');
+            userPre.className = 'query-code';
+            userPre.textContent = '=== USER MESSAGE (query + ES results) ===\n' + chunk.debug_prompt.user;
+            debugBody.appendChild(sysPre);
+            debugBody.appendChild(userPre);
             scrollToBottom();
           }
 
@@ -763,6 +889,7 @@ async function handleSubmit(e) {
             if (chunk.done) {
               assistantBubble.classList.remove('cursor');
               stopGenStats(chunk.stats);
+              _addCopyBtn(assistantBubble, () => fullReply);
             }
             scrollToBottom();
           }
@@ -771,6 +898,7 @@ async function handleSubmit(e) {
     }
 
     assistantBubble.classList.remove('cursor');
+    if (fullReply) _addCopyBtn(assistantBubble, () => fullReply);
     state.conversationHistory.push({ role: 'assistant', content: fullReply });
 
   } catch (err) {
@@ -792,6 +920,27 @@ async function handleSubmit(e) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function _addCopyBtn(bubbleEl, getText) {
+  // Put copy button inside the bubble so it stays visually attached to the content
+  bubbleEl.style.position = 'relative';
+  const btn = document.createElement('button');
+  btn.className = 'btn-copy';
+  btn.title = 'Copy to clipboard';
+  btn.textContent = '[ copy ]';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(getText());
+      btn.textContent = '[ copied ]';
+      setTimeout(() => { btn.textContent = '[ copy ]'; }, 1500);
+    } catch {
+      btn.textContent = '[ failed ]';
+      setTimeout(() => { btn.textContent = '[ copy ]'; }, 1500);
+    }
+  });
+  bubbleEl.appendChild(btn);
+}
+
 function appendMessage(role, text, returnBubble = false) {
   const msg    = document.createElement('div');
   msg.className = `msg ${role}`;
@@ -800,6 +949,9 @@ function appendMessage(role, text, returnBubble = false) {
   if (role === 'assistant') bubble.classList.add('cursor');
   bubble.textContent = text;
   msg.appendChild(bubble);
+  if (role === 'assistant' && text) {
+    _addCopyBtn(bubble, () => bubble.textContent);
+  }
   messagesEl.appendChild(msg);
   scrollToBottom();
   return returnBubble ? bubble : msg;
