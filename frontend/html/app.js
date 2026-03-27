@@ -19,6 +19,7 @@ const maxResultsVal   = document.getElementById('maxResultsVal');
 const allResultsCb    = document.getElementById('allResults');
 const smartQueryCb    = document.getElementById('smartQuery');
 const conciseModeCb   = document.getElementById('conciseMode');
+const threatIntelCb   = document.getElementById('threatIntel');
 const refreshBtn      = document.getElementById('refreshIndices');
 const clearBtn        = document.getElementById('clearChat');
 const modelBadge      = document.getElementById('modelBadge');
@@ -448,6 +449,18 @@ async function handleSubmit(e) {
 
   // Query blocks are created dynamically when generated_query arrives
 
+  // Threat intel enrichment block
+  const enrichDetails = document.createElement('details');
+  enrichDetails.className = 'think-block enrich-block';
+  enrichDetails.hidden = true;
+  const enrichSummary = document.createElement('summary');
+  enrichSummary.textContent = '// threat intel';
+  enrichDetails.appendChild(enrichSummary);
+  const enrichBody = document.createElement('div');
+  enrichBody.className = 'think-body enrich-body';
+  enrichDetails.appendChild(enrichBody);
+  contextMsg.appendChild(enrichDetails);
+
   // Records — collapsed by default
   const contextDetails = document.createElement('details');
   contextDetails.className = 'think-block context-block';
@@ -546,6 +559,7 @@ async function handleSubmit(e) {
         model,
         provider,
         smart_query: smartQueryCb.checked,
+        threat_intel: threatIntelCb.checked,
       }),
     });
 
@@ -591,6 +605,49 @@ async function handleSubmit(e) {
             const { done, total, count } = chunk.query_progress;
             _thinkingBase = `[*] running queries… ${done}/${total} done (+${count} records)`;
             _updateThinking();
+          }
+
+          if (chunk.enrich_status) {
+            _thinkingBase = `[*] ${chunk.enrich_status}`;
+            _updateThinking();
+            if (enrichDetails.hidden) {
+              enrichDetails.hidden = false;
+              enrichSummary.textContent = `// threat intel — ${chunk.enrich_status}`;
+              contextMsg.hidden = false;
+            } else {
+              enrichSummary.textContent = `// threat intel — ${chunk.enrich_status}`;
+            }
+          }
+
+          if (chunk.enrichment) {
+            enrichDetails.hidden = false;
+            enrichDetails.open = true;
+            contextMsg.hidden = false;
+            const e = chunk.enrichment;
+            if (e.error) {
+              enrichBody.insertAdjacentHTML('beforeend',
+                `<div class="enrich-row enrich-error"><span class="enrich-ip">${esc(e.ip)}</span> <span class="muted">${esc(e.error)}</span></div>`);
+            } else {
+              const sources = e.sources || {};
+              const ab  = sources.abuseipdb   || null;
+              const vt  = sources.virustotal  || null;
+              const score   = ab  ? ab.score  : null;
+              const malVt   = vt  ? vt.malicious : null;
+              const threat  = (score != null && score >= 80) || (malVt != null && malVt >= 3);
+              const suspect = (score != null && score >= 25) || (malVt != null && malVt >= 1);
+              const cls = threat ? 'enrich-high' : suspect ? 'enrich-med' : 'enrich-clean';
+              let detail = '';
+              if (ab) detail += `AbuseIPDB: ${ab.score}% (${ab.reports} reports, ${ab.country || '?'})`;
+              if (ab && vt) detail += ' · ';
+              if (vt) detail += `VT: ${vt.malicious} malicious/${vt.suspicious} suspicious`;
+              if (!ab && !vt) detail = 'no data';
+              enrichBody.insertAdjacentHTML('beforeend',
+                `<div class="enrich-row ${cls}">
+                   <span class="enrich-ip">${esc(e.ip)}</span>
+                   <span class="enrich-detail">${esc(detail)}</span>
+                 </div>`);
+            }
+            scrollToBottom();
           }
 
           if (chunk.query_thinking) {

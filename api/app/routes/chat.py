@@ -803,8 +803,30 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         yield f"data: {json.dumps({'context': events})}\n\n"
 
+        # ── Phase 1b: threat intel enrichment (optional) ────────────────────────
+        enrichment_context = ""
+        if req.threat_intel:
+            from ..enrichment import extract_ips, enrich_ip, build_enrichment_context
+            ips = extract_ips(events)
+            if not ips:
+                yield f"data: {json.dumps({'enrich_status': 'no public IPs found in results'})}\n\n"
+            elif not (settings.abuseipdb_api_key or settings.virustotal_api_key):
+                yield f"data: {json.dumps({'enrich_status': 'no threat intel API keys configured — add ABUSEIPDB_API_KEY or VIRUSTOTAL_API_KEY to .env'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'enrich_status': f'looking up {len(ips)} IP(s)…'})}\n\n"
+                enrichments: list[dict] = []
+                for ip in ips:
+                    try:
+                        result = await enrich_ip(ip)
+                        enrichments.append(result)
+                        yield f"data: {json.dumps({'enrichment': result})}\n\n"
+                    except Exception as exc:
+                        yield f"data: {json.dumps({'enrichment': {'ip': ip, 'error': str(exc)}})}\n\n"
+                enrichment_context = build_enrichment_context(enrichments)
+                yield f"data: {json.dumps({'enrich_status': f'enriched {len(enrichments)} IP(s)'})}\n\n"
+
         # ── Phase 2: analyse with LLM ───────────────────────────────────────────
-        context_block = _build_context_block(events)
+        context_block = _build_context_block(events) + enrichment_context
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if req.conversation_history:
             messages.extend(m.model_dump() for m in req.conversation_history[-20:])

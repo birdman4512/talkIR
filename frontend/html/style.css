@@ -470,6 +470,24 @@ a.btn-term { text-decoration: none; display: flex; align-items: center; justify-
   line-height: 1.55;
 }
 
+/* ─── Threat intel enrichment ─────────────────────────────────────────────── */
+.enrich-body { white-space: normal; }
+.enrich-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.enrich-row:last-child { border-bottom: none; }
+.enrich-ip     { font-family: var(--font-mono); color: var(--text); white-space: nowrap; min-width: 110px; }
+.enrich-detail { color: var(--muted); }
+.enrich-high .enrich-ip  { color: var(--danger); }
+.enrich-med  .enrich-ip  { color: #ffcc80; }
+.enrich-clean .enrich-ip { color: var(--accent); }
+.enrich-error .enrich-ip { color: var(--muted); }
+
 /* ─── Token stats ─────────────────────────────────────────────────────────── */
 .msg-stats {
   font-size: 10px;

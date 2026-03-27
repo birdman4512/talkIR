@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     provider: str = "ollama"  # ollama | claude | openai
     smart_query: bool = False
+    threat_intel: bool = False
 
 
 class IndexInfo(BaseModel):

@@ -14,6 +14,8 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    abuseipdb_api_key: str = ""
+    virustotal_api_key: str = ""
 
     jwt_secret: str = ""
 
