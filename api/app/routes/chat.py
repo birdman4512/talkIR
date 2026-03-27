@@ -307,6 +307,8 @@ def _fix_bare_keys(text: str) -> str:
 def _extract_json(text: str) -> dict | None:
     """Pull a JSON object out of freeform LLM output."""
     text = text.strip()
+    # Strip JS-style // line comments (LLMs often add these inside JSON)
+    text = re.sub(r'//[^\n"]*', '', text)
 
     def _try(s: str) -> dict | list | None:
         for attempt in (s, _fix_bare_keys(s)):
