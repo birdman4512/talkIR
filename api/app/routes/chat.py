@@ -81,9 +81,12 @@ Rules:
 - The "query" value must contain EXACTLY ONE top-level key (e.g. "bool", "match", "term", "exists"). NEVER put two query types as sibling keys.
 - To combine conditions use bool.must / bool.should / bool.filter arrays.
 - For "list/show all X" queries: use exists on the relevant field + _source to return only needed columns.
-- For "count/frequency/top N/how many/how often" queries: use aggregations (aggs) and set size:0.
+- For "count/frequency/top N/how many/how often/summary/breakdown/distribution/most common" queries: use aggregations (aggs) and set size:0.
 - NEVER use term to match a field name against itself (e.g. term:{IpAddress:"IpAddress"} is wrong). term matches a specific value.
-- Do not invent specific values unless the user names them.
+- Do not invent specific values unless the user names them. For "summary of X" never put example values in filter clauses.
+- When both a raw field (e.g. DestIP) and an ECS field (e.g. destination.ip) are available, prefer the ECS field — it has the correct type mapping.
+- bool.should without bool.must means OR — add "minimum_should_match":1 so at least one condition must match. Without it, should clauses are optional.
+- NEVER use match on (keyword) fields — use term or terms instead.
 
 Field type guide (use this to choose the right query clause):
 - (keyword)   → exact match with term/terms, use directly in aggs
@@ -119,6 +122,9 @@ Example — "username + source IP + count" (composite agg):
 
 Example — "events in the last 24 hours" (date range):
 {"query":{"range":{"@timestamp":{"gte":"now-24h","lte":"now"}}},"size":20}
+
+Example — "summary/breakdown/top destination IPs" (terms agg — NEVER invent values, just aggregate):
+{"query":{"match_all":{}},"aggs":{"by_dest_ip":{"terms":{"field":"destination.ip","size":50,"order":{"_count":"desc"}}}},"size":0}
 
 Example — "per user: count successful vs failed logins" (filter sub-aggs — use this pattern for conditional counts within buckets, NOT bucket_count which does not exist):
 {"query":{"match_all":{}},"aggs":{"by_user":{"terms":{"field":"UserName","size":50},"aggs":{"successful":{"filter":{"terms":{"EventID":[4624]}}},"failed":{"filter":{"terms":{"EventID":[4625]}}}}}},"size":0}""")
@@ -639,9 +645,16 @@ def _repair_json(text: str) -> dict | list | None:
     """Append missing closing brackets/braces and retry parse."""
     missing_brackets = text.count('[') - text.count(']')
     missing_braces   = text.count('{') - text.count('}')
-    if missing_brackets <= 0 and missing_braces <= 0:
+    if missing_brackets <= 0 and missing_braces <= 0 and missing_brackets >= 0:
         return None
     repaired = text.rstrip()
+    # Strip extra closing brackets that have no matching opener
+    if missing_brackets < 0:
+        for _ in range(-missing_brackets):
+            idx = repaired.rfind(']')
+            if idx != -1:
+                repaired = repaired[:idx] + repaired[idx+1:]
+        missing_brackets = 0
     trailing = ''
     while repaired.endswith('}') and missing_brackets > 0:
         trailing = '}' + trailing
