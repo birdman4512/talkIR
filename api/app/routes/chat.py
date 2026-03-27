@@ -99,6 +99,30 @@ def _supports_thinking(model: str) -> bool:
     return any(p in name for p in _THINKING_MODEL_PATTERNS)
 
 
+def _friendly_ollama_error(raw: str) -> str:
+    """Convert raw Ollama error text to a human-readable message."""
+    # Unwrap {"error": "..."} JSON if present
+    try:
+        msg = json.loads(raw).get("error", raw)
+    except (json.JSONDecodeError, AttributeError):
+        msg = raw
+
+    m = re.search(r"requires more system memory \((.+?)\) than is available \((.+?)\)", msg)
+    if m:
+        return (
+            f"Not enough RAM: model needs {m.group(1)} but only {m.group(2)} is free. "
+            "Switch to a smaller model (e.g. llama3.2:3b) or a cloud provider (Claude / OpenAI)."
+        )
+    if "no longer running" in msg:
+        return (
+            "Model process crashed — likely out of memory. "
+            "Try a smaller model or reduce the result count."
+        )
+    if "does not support thinking" in msg:
+        return f"Model does not support thinking mode: {msg}"
+    return msg
+
+
 def _sanitize_query_body(body: dict) -> dict:
     """Fix common LLM query mistakes."""
     q = body.get("query", {})
@@ -235,7 +259,7 @@ async def _llm_complete(provider: str, model: str, system: str, user: str) -> st
             resp = await client.post(f"{settings.ollama_host}/api/chat", json=payload)
             data = resp.json()
             if "error" in data:
-                raise ValueError(f"Ollama error: {data['error']}")
+                raise ValueError(_friendly_ollama_error(data["error"]))
             return data.get("message", {}).get("content", "")
 
 
@@ -358,7 +382,7 @@ async def _smart_search(
                 content_parts.append(text)
         if ollama_error:
             events = await _keyword_search(indices, query, max_results)
-            yield ("result", events, None, f"Query generation failed: {ollama_error} — fell back to keyword search.")
+            yield ("result", events, None, f"Query generation failed: {_friendly_ollama_error(ollama_error)} — fell back to keyword search.")
             return
         raw = "".join(content_parts)
     else:
@@ -535,7 +559,7 @@ async def _stream_ollama(model: str, messages: list[dict]):
                     continue
 
                 if "error" in chunk:
-                    yield ("error", f"Ollama: {chunk['error']}", False, {})
+                    yield ("error", _friendly_ollama_error(chunk["error"]), False, {})
                     return
 
                 # Native thinking field — Ollama 0.6+ with think: true
