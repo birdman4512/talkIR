@@ -405,6 +405,21 @@ def _sanitize_query_body(body: dict) -> dict:
 
     q = body.get("query", {})
     if isinstance(q, dict):
+        # Aggregation syntax inside the query key — LLM confused terms agg with
+        # terms query.  Detect by presence of aggregation-only keys (field+size,
+        # field+order) and convert to a proper agg body.
+        # e.g. {"query": {"terms": {"field": "destination.ip", "size": 50, "order": {...}}}}
+        if "terms" in q and isinstance(q["terms"], dict):
+            td = q["terms"]
+            if "field" in td and ("size" in td or "order" in td):
+                field = td["field"]
+                agg_def = {"terms": td}
+                agg_name = "by_" + field.replace(".", "_").replace("-", "_")
+                body["query"] = {"match_all": {}}
+                body.setdefault("aggs", {})[agg_name] = agg_def
+                body["size"] = 0
+                q = body["query"]
+
         # aggs/aggregations inside query — hoist to top level
         for agg_key in ("aggs", "aggregations"):
             if agg_key in q:
