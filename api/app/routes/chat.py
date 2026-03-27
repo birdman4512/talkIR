@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from ..auth import require_auth
 from ..es_client import get_es_client
-from ..models import ChatRequest
+from ..models import ChatRequest, EqlRequest
 from ..config import settings
 
 router = APIRouter()
@@ -149,9 +149,17 @@ async def _get_mapping_fields(
 ) -> tuple[str, dict[str, str]]:
     """Return (prompt_string, field_type_dict) from ES index mappings.
 
-    prompt_string — "FieldName (type), …" for the query-gen prompt (≤60 fields)
-    field_type_dict — {field_name: type_hint} for runtime query sanitisation
+    prompt_string — "FieldName (type), …" for the query-gen prompt (≤100 fields,
+                    security-relevant fields prioritised)
+    field_type_dict — {field_name: type_hint} for runtime query sanitisation (all fields)
     """
+    # Keywords that signal security-relevant fields — prioritised in the prompt
+    _PRIORITY_KEYWORDS = (
+        "user", "login", "auth", "event", "ip", "host", "process",
+        "account", "domain", "name", "id", "time", "command", "hash",
+        "source", "target", "subject", "logon", "privilege", "service",
+        "path", "exe", "cmdline", "sid", "computer",
+    )
     try:
         target = ",".join(indices[:5]) if indices else "_all"
         mapping = await es.indices.get_mapping(index=target)
@@ -168,7 +176,15 @@ async def _get_mapping_fields(
         if not unique:
             return "(unavailable)", {}
         field_types = dict(unique)
-        prompt_str = ", ".join(f"{n} ({h})" for n, h in unique[:60])
+        # Sort: priority fields first (by lowest keyword match position), then alphabetical
+        def _priority(item: tuple[str, str]) -> tuple[int, str]:
+            name_lower = item[0].lower()
+            for i, kw in enumerate(_PRIORITY_KEYWORDS):
+                if kw in name_lower:
+                    return (i, item[0])
+            return (len(_PRIORITY_KEYWORDS), item[0])
+        sorted_fields = sorted(unique, key=_priority)
+        prompt_str = ", ".join(f"{n} ({h})" for n, h in sorted_fields[:100])
         return prompt_str, field_types
     except Exception:
         return "(unavailable)", {}
@@ -231,13 +247,62 @@ def _extract_referenced_fields(obj, out: set[str] | None = None) -> set[str]:
     return out
 
 
+def _suggest_field(unknown: str, field_types: dict[str, str]) -> str | None:
+    """Find the closest known field name via case-insensitive substring matching."""
+    lower = unknown.lower().replace(".", "").replace("_", "")
+    candidates = []
+    for f in field_types:
+        f_norm = f.lower().replace(".", "").replace("_", "")
+        if lower in f_norm or f_norm in lower:
+            candidates.append(f)
+    # Prefer shorter names (more specific match)
+    candidates.sort(key=lambda x: (len(x), x))
+    return candidates[0] if candidates else None
+
+
 def _check_unknown_fields(body: dict, field_types: dict[str, str]) -> list[str]:
-    """Return field names used in body that are not in field_types."""
+    """Return field names used in body that are not in field_types.
+    Returns empty list when field_types is empty (mapping unavailable)."""
+    if not field_types:
+        return []
     all_known = set(field_types.keys()) | {f + ".keyword" for f in field_types}
     # Also allow meta fields
     all_known |= {"_id", "_index", "_score", "_type", "@timestamp"}
     used = _extract_referenced_fields(body)
     return sorted(f for f in used if f not in all_known)
+
+
+def _rewrite_unknown_fields(body: dict, field_types: dict[str, str]) -> dict[str, str]:
+    """
+    Attempt to rewrite unknown field names to their closest known equivalent.
+    Returns a dict of {original: replacement} for any rewrites made.
+    Operates on body in-place.
+    """
+    if not field_types:
+        return {}
+    all_known = set(field_types.keys()) | {f + ".keyword" for f in field_types}
+    all_known |= {"_id", "_index", "_score", "_type", "@timestamp"}
+    unknown = {f for f in _extract_referenced_fields(body) if f not in all_known}
+    rewrites: dict[str, str] = {}
+    for f in unknown:
+        suggestion = _suggest_field(f, field_types)
+        if suggestion:
+            rewrites[f] = suggestion
+    if rewrites:
+        _apply_field_rewrites(body, rewrites)
+    return rewrites
+
+
+def _apply_field_rewrites(obj, rewrites: dict[str, str]) -> None:
+    """Recursively replace field values in a query/agg body."""
+    if isinstance(obj, dict):
+        if "field" in obj and obj["field"] in rewrites:
+            obj["field"] = rewrites[obj["field"]]
+        for v in obj.values():
+            _apply_field_rewrites(v, rewrites)
+    elif isinstance(obj, list):
+        for item in obj:
+            _apply_field_rewrites(item, rewrites)
 
 
 _THINKING_MODEL_PATTERNS = ("deepseek", "r1", "qwq", "thinking")
@@ -330,7 +395,63 @@ def _sanitize_query_body(body: dict) -> dict:
     # Fix: find the bucket agg siblings and move the sub-aggs into them.
     _fix_typeless_aggs(aggs)
 
+    # Fix wrong terms/term query syntax emitted by LLMs that confuse the agg
+    # syntax with query syntax.  e.g.:
+    #   wrong: {"terms": {"field": "EventID", "value": 4624}}
+    #   right: {"terms": {"EventID": [4624]}}
+    _fix_terms_query_syntax(body.get("query", {}))
+    # Also fix inside agg filters
+    _fix_terms_in_aggs(aggs)
+
     return body
+
+
+def _fix_terms_query_syntax(node: object) -> None:
+    """
+    Recursively fix LLM-generated terms/term query clauses that use the wrong
+    syntax (agg-style field/value keys instead of query-style field name key).
+
+    Wrong: {"terms": {"field": "EventID", "value": 4624}}
+           {"term":  {"field": "EventID", "value": "Login"}}
+    Right: {"terms": {"EventID": [4624]}}
+           {"term":  {"EventID": "Login"}}
+    """
+    if not isinstance(node, dict):
+        return
+    for key, val in list(node.items()):
+        if key in ("terms", "term") and isinstance(val, dict):
+            field_name = val.get("field")
+            if field_name and isinstance(field_name, str) and "value" in val:
+                raw_val = val["value"]
+                if key == "terms":
+                    node[key] = {field_name: raw_val if isinstance(raw_val, list) else [raw_val]}
+                else:  # "term"
+                    node[key] = {field_name: raw_val}
+                continue  # already rewritten, no need to recurse into it
+        # Recurse into nested dicts and lists
+        if isinstance(val, dict):
+            _fix_terms_query_syntax(val)
+        elif isinstance(val, list):
+            for item in val:
+                _fix_terms_query_syntax(item)
+
+
+def _fix_terms_in_aggs(aggs: dict) -> None:
+    """Recursively fix terms/term query syntax inside agg filter clauses."""
+    if not isinstance(aggs, dict):
+        return
+    for agg_def in aggs.values():
+        if not isinstance(agg_def, dict):
+            continue
+        # Fix filter queries
+        for fk in ("filter", "filters"):
+            fval = agg_def.get(fk)
+            if isinstance(fval, dict):
+                _fix_terms_query_syntax(fval)
+        # Recurse into sub-aggs
+        sub = agg_def.get("aggs") or agg_def.get("aggregations")
+        if isinstance(sub, dict):
+            _fix_terms_in_aggs(sub)
 
 
 _BUCKET_AGG_TYPES = frozenset({
@@ -633,6 +754,9 @@ async def _smart_search(
         fields=fields_str,
     )
 
+    # Surface query-gen prompt in debug mode
+    yield ("debug_query_prompt", system, query)
+
     # Generate query — stream for Ollama to surface thinking, batch for others
     if provider == "ollama":
         content_parts: list[str] = []
@@ -679,8 +803,10 @@ async def _smart_search(
 
         # Sanitize structure first (hoist aggs from inside query), then fix field types
         unknown_fields: list[str] = []
+        rewrites_all: dict[str, str] = {}
         for qb in valid_raw:
             _sanitize_query_body(qb)
+            rewrites_all.update(_rewrite_unknown_fields(qb, field_types))
             _fix_agg_fields(qb.get("aggs", qb.get("aggregations", {})), field_types)
             unknown_fields.extend(_check_unknown_fields(qb, field_types))
 
@@ -727,17 +853,33 @@ async def _smart_search(
         parts = []
         if errors:
             parts.append(f"Some queries failed: {'; '.join(errors)}")
+        if rewrites_all:
+            parts.append(f"Note: auto-corrected field(s): {', '.join(f'{k} → {v}' for k, v in rewrites_all.items())}")
         if unknown_fields:
-            parts.append(f"Warning: unknown field(s) used: {', '.join(sorted(set(unknown_fields)))}")
+            suggestions = {f: _suggest_field(f, field_types) for f in unknown_fields}
+            parts.append("Warning: unresolvable field(s): " + ", ".join(
+                f"{f} (try: {suggestions[f]})" if suggestions[f] else f
+                for f in sorted(set(unknown_fields))
+            ))
         fallback = "\n\n".join(parts) if parts else None
         yield ("result", deduped[:max_results], valid_bodies, fallback)
 
     else:
         # ── Single query ────────────────────────────────────────────────────────
         _sanitize_query_body(parsed)  # hoist aggs from inside query before fixing field types
+        rewrites = _rewrite_unknown_fields(parsed, field_types)
         _fix_agg_fields(parsed.get("aggs", parsed.get("aggregations", {})), field_types)
-        unknown = _check_unknown_fields(parsed, field_types)
-        unknown_warn = (f"\n\nWarning: query used unknown field(s): {', '.join(unknown)} — these do not exist in the index and will return no results. Available fields: {', '.join(sorted(field_types)[:20])}..." if unknown else None)
+        still_unknown = _check_unknown_fields(parsed, field_types)
+        warn_parts = []
+        if rewrites:
+            warn_parts.append(f"Note: auto-corrected field(s): {', '.join(f'{k} → {v}' for k, v in rewrites.items())}")
+        if still_unknown:
+            suggestions = {f: _suggest_field(f, field_types) for f in still_unknown}
+            warn_parts.append("Warning: unresolvable field(s): " + ", ".join(
+                f"{f} (try: {suggestions[f]})" if suggestions[f] else f
+                for f in sorted(still_unknown)
+            ))
+        unknown_warn = ("\n\n" + "\n\n".join(warn_parts)) if warn_parts else None
         try:
             events = await _run_query(es, target, parsed, max_results)
             yield ("result", events, parsed, unknown_warn)
@@ -1033,7 +1175,9 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                 query_body = None
                 fallback_reason = None
                 async for item in _smart_search(provider, model, indices, req.query, req.max_results):
-                    if item[0] == "query_thinking":
+                    if item[0] == "debug_query_prompt":
+                        yield f"data: {json.dumps({'debug_query_prompt': {'system': item[1], 'user': item[2]}})}\n\n"
+                    elif item[0] == "query_thinking":
                         yield f"data: {json.dumps({'query_thinking': item[1]})}\n\n"
                     elif item[0] == "query_progress":
                         _, done, total, count = item
@@ -1089,7 +1233,11 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
         messages: list[dict] = [{"role": "system", "content": persona_prompt}]
         if req.conversation_history:
             messages.extend(m.model_dump() for m in req.conversation_history[-20:])
-        messages.append({"role": "user", "content": req.query + context_block})
+        user_message = req.query + context_block
+        messages.append({"role": "user", "content": user_message})
+
+        # Emit full prompt to frontend so it can be shown in debug panel
+        yield f"data: {json.dumps({'debug_prompt': {'system': persona_prompt, 'user': user_message}})}\n\n"
 
         try:
             if provider == "claude":
@@ -1120,3 +1268,39 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+_EQL_SYSTEM = """Convert the given Elasticsearch Query DSL JSON into an equivalent Elasticsearch EQL (Event Query Language) query.
+
+EQL syntax rules:
+- Every query starts with an event category or "any": any where <condition>
+- Use "and", "or", "not" for logic; "in ()", "like~", ":" for matching
+- Numeric comparisons: ==, !=, <, >, <=, >=
+- For sequences: sequence [event1] [event2]
+- Field names are unquoted: EventID == 4624
+- String values are quoted: UserName == "SYSTEM"
+- Wildcards: UserName like~ "admin*"
+- For aggregation queries (aggs) that count per field, convert to:
+  any where <filter_condition> | stats count() by <field>
+
+Output ONLY the EQL string — no explanation, no markdown, no code fences."""
+
+
+@router.post("/eql")
+async def convert_to_eql(req: EqlRequest, _: dict = Depends(require_auth)):
+    """Convert an ES DSL query body to EQL via the LLM."""
+    provider = req.provider or "ollama"
+    model = req.model or settings.ollama_model
+    query_json = json.dumps(req.query_body, indent=2)
+    try:
+        eql = await _llm_complete(
+            provider, model,
+            system=_EQL_SYSTEM,
+            user=f"Convert this ES DSL query to EQL:\n{query_json}",
+        )
+        # Strip markdown fences if model wrapped it
+        eql = re.sub(r'^```(?:eql|sql)?\s*', '', eql.strip(), flags=re.IGNORECASE)
+        eql = re.sub(r'\s*```$', '', eql.strip())
+        return {"eql": eql.strip()}
+    except Exception as exc:
+        return {"error": str(exc)}
