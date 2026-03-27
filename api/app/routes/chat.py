@@ -41,8 +41,9 @@ Rules:
 - No join queries (has_child, has_parent, nested) — documents are flat.
 - The "query" value must contain EXACTLY ONE top-level key (e.g. "bool", "match", "term", "exists"). NEVER put two query types as sibling keys.
 - To combine conditions use bool.must / bool.should / bool.filter arrays.
-- For "list/show/relationship" queries: use match_all + _source with relevant fields.
+- For "list/show all X" queries: use exists on the relevant field + _source to return only needed columns.
 - For "count/frequency/top N/how many/how often" queries: use aggregations (aggs) and set size:0.
+- NEVER use term to match a field name against itself (e.g. term:{IpAddress:"IpAddress"} is wrong). term matches a specific value.
 - Do not invent specific values unless the user names them.
 
 For questions requiring different event types (e.g. lateral movement needs auth events AND process events), return multiple queries:
@@ -52,7 +53,10 @@ Use at most 3 queries. Prefer a single query unless multiple are clearly needed.
 
 Fields ($indices): $fields
 
-Example — "users signing in from 1.2.3.4":
+Example — "list all IP addresses" (exists — returns records that have the field):
+{"query":{"exists":{"field":"IpAddress"}},"_source":["IpAddress","@timestamp"],"size":20}
+
+Example — "users signing in from 1.2.3.4" (term — matches a specific known value):
 {"query":{"bool":{"must":[{"term":{"IpAddress":"1.2.3.4"}},{"exists":{"field":"UserName"}}]}},"_source":["UserName","IpAddress","@timestamp"],"size":20}
 
 Example — "how often did each user sign in":
