@@ -435,6 +435,8 @@ def _sanitize_query_body(body: dict) -> dict:
     # Fix composite sources that are strings instead of source-objects
     # e.g. "sources": ["UserName"] → "sources": [{"UserName": {"terms": {"field": "UserName"}}}]
     for agg_def in aggs.values():
+        if not isinstance(agg_def, dict):
+            continue
         composite = agg_def.get("composite", {})
         sources = composite.get("sources")
         if isinstance(sources, list):
