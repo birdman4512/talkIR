@@ -319,7 +319,6 @@ document.querySelectorAll('.btn-sort').forEach(btn => {
 });
 
 async function pullModel(modelName, btn) {
-  const row = btn.closest('.catalogue-row');
   const progress = document.createElement('div');
   progress.className = 'pull-progress';
   btn.replaceWith(progress);
@@ -665,7 +664,7 @@ async function handleSubmit(e) {
               }, 100);
             }
             qThinkChars += chunk.query_thinking.length;
-            qThinkBody.textContent += chunk.query_thinking;
+            qThinkBody.insertAdjacentText('beforeend', chunk.query_thinking);
             qThinkBody.scrollTop = qThinkBody.scrollHeight;
             scrollToBottom();
           }
@@ -736,7 +735,7 @@ async function handleSubmit(e) {
               }, 100);
             }
             thinkChars += chunk.thinking.length;
-            thinkBody.textContent += chunk.thinking;
+            thinkBody.insertAdjacentText('beforeend', chunk.thinking);
             thinkBody.scrollTop = thinkBody.scrollHeight;
             scrollToBottom();
           }
