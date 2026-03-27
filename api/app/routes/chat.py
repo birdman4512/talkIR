@@ -423,6 +423,14 @@ def _sanitize_query_body(body: dict) -> dict:
 
     aggs = body.get("aggs", body.get("aggregations", {}))
 
+    # LLMs sometimes put "size" as a sibling key inside the aggs object rather
+    # than at the top level — hoist it out and remove from aggs.
+    for agg_key in ("aggs", "aggregations"):
+        if agg_key in body and isinstance(body[agg_key], dict) and "size" in body[agg_key]:
+            body.setdefault("size", body[agg_key].pop("size"))
+    # Re-read aggs after potential mutation above
+    aggs = body.get("aggs", body.get("aggregations", {}))
+
     # size:0 with no aggregations returns nothing — remove the override and
     # let _run_query apply its normal cap instead
     if body.get("size") == 0 and not aggs:
@@ -431,6 +439,22 @@ def _sanitize_query_body(body: dict) -> dict:
     # aggs present but no size set — default to 0 (return buckets only)
     if aggs and "size" not in body:
         body["size"] = 0
+
+    # term/terms with wildcard "*" value is invalid — rewrite as match_all or exists.
+    # e.g. {"term": {"destination.ip": "*"}} → {"match_all": {}}
+    def _fix_wildcard_term(node: object) -> object:
+        if not isinstance(node, dict):
+            return node
+        for key in ("term", "terms"):
+            if key in node and isinstance(node[key], dict):
+                vals = list(node[key].values())
+                if vals and (vals[0] == "*" or vals == ["*"]):
+                    return {"match_all": {}}
+        return {k: _fix_wildcard_term(v) if isinstance(v, dict) else
+                   [_fix_wildcard_term(i) for i in v] if isinstance(v, list) else v
+                for k, v in node.items()}
+
+    body["query"] = _fix_wildcard_term(body.get("query", {"match_all": {}}))
 
     # Fix composite sources that are strings instead of source-objects
     # e.g. "sources": ["UserName"] → "sources": [{"UserName": {"terms": {"field": "UserName"}}}]
