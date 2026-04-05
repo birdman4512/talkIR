@@ -16,6 +16,20 @@ from app.routes.chat import (
     _check_unknown_fields,
     _rewrite_unknown_fields,
     _extract_json,
+    _build_evidence_summary,
+    _deterministic_query_body_to_eql,
+    _deterministic_query_body_to_esql,
+    _build_indicator_fast_path_query,
+    _build_field_list_fast_path_query,
+    _build_ip_count_fast_path_query,
+    _build_mft_between_dates_query,
+    _build_failed_login_accounts_query,
+    _build_history_between_dates_query,
+    _build_schema_profile,
+    _get_role_candidates,
+    _maybe_build_semantic_clarification,
+    _parse_query_intent,
+    _extract_indicator,
 )
 
 
@@ -309,6 +323,11 @@ class TestFieldSuggestion:
         unknowns = _check_unknown_fields(body, self.FIELD_TYPES)
         assert "SecurityID" in unknowns
 
+    def test_check_detects_unknown_term_query_key(self):
+        body = {"query": {"term": {"SourceAddressRaw": "1.2.3.4"}}}
+        unknowns = _check_unknown_fields(body, self.FIELD_TYPES)
+        assert "SourceAddressRaw" in unknowns
+
     def test_check_skipped_when_no_field_types(self):
         body = {"aggs": {"by_x": {"terms": {"field": "AnyField"}}}}
         assert _check_unknown_fields(body, {}) == []
@@ -326,3 +345,198 @@ class TestFieldSuggestion:
         rewrites = _rewrite_unknown_fields(body, self.FIELD_TYPES)
         assert rewrites == {}
         assert body["aggs"]["by_event"]["terms"]["field"] == "EventID"
+
+    def test_rewrite_corrects_term_query_key(self):
+        body = {"query": {"term": {"sourceaddress": "1.2.3.4"}}}
+        rewrites = _rewrite_unknown_fields(body, self.FIELD_TYPES)
+        assert rewrites["sourceaddress"] == "SourceAddress"
+        assert body["query"]["term"]["SourceAddress"] == "1.2.3.4"
+        assert "sourceaddress" not in body["query"]["term"]
+
+
+class TestEvidenceSummary:
+    def test_evidence_summary_reports_first_and_last_seen(self):
+        events = [
+            {"@timestamp": "2024-01-02T00:00:00Z", "event_type": "dns", "src_ip": "1.2.3.4"},
+            {"@timestamp": "2024-01-01T00:00:00Z", "event_type": "login", "src_ip": "1.2.3.4"},
+        ]
+        summary = _build_evidence_summary(events, "When have I seen 1.2.3.4 before?")
+        assert "First seen: 2024-01-01T00:00:00Z" in summary
+        assert "Last seen: 2024-01-02T00:00:00Z" in summary
+        assert "Queried indicator matches: 1.2.3.4 (2)" in summary
+
+    def test_evidence_summary_uses_file_mtime_when_timestamp_missing(self):
+        events = [
+            {"file": {"mtime": "2024-07-12T00:12:35Z", "path": "C:/a.txt"}},
+            {"file": {"mtime": "2024-07-13T00:12:35Z", "path": "C:/b.txt"}},
+        ]
+        summary = _build_evidence_summary(events, "What files changed?")
+        assert "First seen: 2024-07-12T00:12:35Z" in summary
+        assert "Last seen: 2024-07-13T00:12:35Z" in summary
+
+    def test_evidence_summary_formats_aggregate_rows(self):
+        events = [
+            {"by_source_ip": "1.2.3.4", "count": 10},
+            {"by_source_ip": "5.6.7.8", "count": 5},
+        ]
+        summary = _build_evidence_summary(events, "List source IPs with counts")
+        assert "Matching groups: 2" in summary
+        assert 'Row 1: {"by_source_ip":"1.2.3.4","count":10}' in summary
+
+
+class TestDeterministicEql:
+    def test_term_query_translates_without_llm(self):
+        body = {"query": {"term": {"source.ip": "1.2.3.4"}}, "size": 5}
+        assert _deterministic_query_body_to_eql(body) == 'any where source.ip == "1.2.3.4" | head 5'
+
+    def test_bool_query_translates_without_llm(self):
+        body = {
+            "query": {
+                "bool": {
+                    "must": [{"term": {"source.ip": "1.2.3.4"}}],
+                    "must_not": [{"term": {"event.outcome": "failure"}}],
+                }
+            }
+        }
+        assert _deterministic_query_body_to_eql(body) == 'any where source.ip == "1.2.3.4" and not (event.outcome == "failure")'
+
+    def test_terms_agg_translates_to_stats(self):
+        body = {"query": {"match_all": {}}, "aggs": {"by_ip": {"terms": {"field": "source.ip"}}}, "size": 0}
+        assert _deterministic_query_body_to_eql(body) == "any where true | stats count() by source.ip"
+
+
+class TestDeterministicEsql:
+    def test_term_query_translates_with_indices(self):
+        body = {"query": {"term": {"source.ip": "1.2.3.4"}}, "size": 5}
+        assert _deterministic_query_body_to_esql(body, ["auth-*"]) == 'FROM auth-* | WHERE source.ip == "1.2.3.4" | LIMIT 5'
+
+    def test_exists_query_keeps_requested_fields(self):
+        body = {"query": {"exists": {"field": "destination.ip"}}, "_source": ["destination.ip", "@timestamp"], "size": 20}
+        assert _deterministic_query_body_to_esql(body, ["windows.eventlogs.rdpauth-*"]) == (
+            "FROM windows.eventlogs.rdpauth-* | WHERE destination.ip IS NOT NULL | KEEP destination.ip, `@timestamp` | LIMIT 20"
+        )
+
+    def test_terms_agg_translates_to_esql_stats(self):
+        body = {"query": {"match_all": {}}, "aggs": {"by_ip": {"terms": {"field": "source.ip", "size": 10, "order": {"_count": "desc"}}}}, "size": 0}
+        assert _deterministic_query_body_to_esql(body, ["auth-*"]) == (
+            "FROM auth-* | STATS count = COUNT(*) BY source.ip | SORT count DESC | LIMIT 10"
+        )
+
+
+class TestIndicatorFastPath:
+    def test_extracts_ipv4_indicator(self):
+        assert _extract_indicator("When have I seen 1.2.3.4 before?") == ("ip", "1.2.3.4")
+
+    def test_extracts_ipv6_indicator(self):
+        assert _extract_indicator("What was ::1 doing?") == ("ip", "::1")
+
+    def test_extracts_ipv6_indicator_from_seen_before_question(self):
+        assert _extract_indicator("When have I seen ::1 before and what was it doing?") == ("ip", "::1")
+
+    def test_builds_ip_hunt_query(self):
+        field_types = {
+            "source.ip": "ip",
+            "destination.ip": "ip",
+            "@timestamp": "date",
+            "process.name": "keyword",
+        }
+        body = _build_indicator_fast_path_query("When have I seen 1.2.3.4 before?", field_types, 10)
+        assert body is not None
+        should = body["query"]["bool"]["should"]
+        assert {"term": {"source.ip": "1.2.3.4"}} in should
+        assert {"term": {"destination.ip": "1.2.3.4"}} in should
+        assert body["size"] == 10
+
+
+class TestFieldListFastPath:
+    def test_builds_destination_ip_list_query(self):
+        field_types = {"destination.ip": "ip", "@timestamp": "date"}
+        body = _build_field_list_fast_path_query("Give me a list of destination IP addresses", field_types, 20)
+        assert body == {
+            "query": {"exists": {"field": "destination.ip"}},
+            "_source": ["destination.ip", "@timestamp"],
+            "size": 20,
+        }
+
+
+class TestSemanticFastPaths:
+    def test_schema_profile_keeps_role_scores(self):
+        profile = _build_schema_profile(
+            {"SourceIP": "ip", "DestIP": "ip"},
+            {"SourceIP": "192.168.1.10", "DestIP": "192.168.1.20"},
+        )
+        candidates = _get_role_candidates(profile, "source_ip", 2)
+        assert candidates[0]["field"] == "SourceIP"
+        assert candidates[0]["score"] >= candidates[1]["score"]
+
+    def test_parses_frequency_breakdown_intent(self):
+        intent = _parse_query_intent("Give me a list of source IP addresses and how many times they appear")
+        assert intent["name"] == "frequency_breakdown"
+        assert intent["entity_role"] == "source_ip"
+
+    def test_builds_destination_ip_count_query(self):
+        field_types = {"destination.ip": "ip"}
+        body = _build_ip_count_fast_path_query("Give me a list of destination IP addresses with counts", field_types, 20)
+        assert body == {
+            "query": {"exists": {"field": "destination.ip"}},
+            "aggs": {
+                "by_destination_ip": {
+                    "terms": {"field": "destination.ip", "size": 20, "order": {"_count": "desc"}}
+                }
+            },
+            "size": 0,
+        }
+
+    def test_builds_mft_between_dates_query(self):
+        field_types = {"file.path": "keyword", "file.mtime": "date", "file.name": "keyword", "@timestamp": "date"}
+        body = _build_mft_between_dates_query(
+            "What files were changed between 2024-07-01 and 2024-07-03",
+            ["windows.ntfs.mft-*"],
+            field_types,
+            25,
+        )
+        assert body is not None
+        assert body["query"]["range"]["file.mtime"]["gte"] == "2024-07-01T00:00:00Z"
+        assert body["query"]["range"]["file.mtime"]["lte"] == "2024-07-03T23:59:59Z"
+        assert body["sort"] == [{"file.mtime": {"order": "asc"}}]
+
+    def test_builds_failed_login_account_query(self):
+        field_types = {"user.name": "keyword", "event.code": "keyword", "source.ip": "ip"}
+        body = _build_failed_login_accounts_query(
+            "Tell me about what accounts failed logins",
+            ["windows.eventlogs.evtx-*"],
+            field_types,
+            15,
+        )
+        assert body is not None
+        assert {"term": {"event.code": "4625"}} in body["query"]["bool"]["should"]
+        assert body["aggs"]["by_account"]["terms"]["field"] == "user.name"
+
+    def test_builds_history_between_dates_query(self):
+        field_types = {"visited_url": "keyword", "url.original": "wildcard", "visit_time": "date", "title": "text+kw", "user.name": "keyword"}
+        body = _build_history_between_dates_query(
+            "What websites were visited between 2024-07-01 and 2024-07-03",
+            ["windows.applications.chrome.history-*"],
+            field_types,
+            30,
+        )
+        assert body is not None
+        assert body["query"]["range"]["visit_time"]["gte"] == "2024-07-01T00:00:00Z"
+        assert body["query"]["range"]["visit_time"]["lte"] == "2024-07-03T23:59:59Z"
+        assert body["_source"][0] == "visited_url"
+        assert body["sort"] == [{"visit_time": {"order": "asc"}}]
+
+    def test_requests_clarification_for_generic_ip_role(self):
+        profile = _build_schema_profile(
+            {"ClientIP": "ip", "ServerIP": "ip", "@timestamp": "date"},
+            {"ClientIP": "192.168.1.10", "ServerIP": "192.168.1.20"},
+        )
+        clarification = _maybe_build_semantic_clarification(
+            "Give me a list of IP addresses and how many times they appear",
+            ["custom.logs-*"],
+            profile,
+        )
+        assert clarification is not None
+        assert clarification["role"] == "ip"
+        assert "ClientIP" in clarification["options"]
+        assert "ServerIP" in clarification["options"]

@@ -1,7 +1,10 @@
 import asyncio
+import ipaddress
 import json
 import re
 import httpx
+from collections import Counter
+from datetime import datetime
 from string import Template
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -86,6 +89,7 @@ Rules:
 - NEVER use term to match a field name against itself (e.g. term:{IpAddress:"IpAddress"} is wrong). term matches a specific value.
 - Do not invent specific values unless the user names them. For "summary of X" never put example values in filter clauses.
 - When both a raw field (e.g. DestIP) and an ECS field (e.g. destination.ip) are available, prefer the ECS field — it has the correct type mapping.
+- For authentication-style Windows event logs (especially RDPAuth and Security logons), the remote client is usually in source.ip rather than destination.ip.
 - bool.should without bool.must means OR — add "minimum_should_match":1 so at least one condition must match. Without it, should clauses are optional.
 - NEVER use match on (keyword) fields — use term or terms instead.
 - JSON syntax: the colon separating a key from its value is OUTSIDE the quoted string. Write "match_all": {} NOT "match_all:{}". The string "match_all:{}" is a string literal, not a query clause.
@@ -184,7 +188,7 @@ def _collect_sample_values(obj, prefix: str, out: dict[str, str], depth: int = 0
 async def _get_field_samples(es, indices: list[str]) -> dict[str, str]:
     """Return {field_path: example_value} from a small sample of documents."""
     try:
-        target = ",".join(indices[:5]) if indices else "_all"
+        target = ",".join(indices) if indices else "_all"
         result = await es.search(
             index=target,
             body={"size": 5, "query": {"match_all": {}}, "_source": True},
@@ -199,7 +203,7 @@ async def _get_field_samples(es, indices: list[str]) -> dict[str, str]:
 
 async def _get_mapping_fields(
     es, indices: list[str]
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict[str, str], dict[str, str]]:
     """Return (prompt_string, field_type_dict) from ES index mappings.
 
     prompt_string — "FieldName (type), …" for the query-gen prompt (≤100 fields,
@@ -214,7 +218,7 @@ async def _get_mapping_fields(
         "path", "exe", "cmdline", "sid", "computer",
     )
     try:
-        target = ",".join(indices[:5]) if indices else "_all"
+        target = ",".join(indices) if indices else "_all"
         mapping = await es.indices.get_mapping(index=target)
         fields: list[tuple[str, str]] = []
         for idx_data in mapping.values():
@@ -246,9 +250,9 @@ async def _get_mapping_fields(
             else:
                 parts.append(f"{n} ({h})")
         prompt_str = ", ".join(parts)
-        return prompt_str, field_types
+        return prompt_str, field_types, samples
     except Exception:
-        return "(unavailable)", {}
+        return "(unavailable)", {}, {}
 
 
 def _fix_agg_fields(aggs: dict, field_types: dict[str, str]) -> None:
@@ -313,6 +317,38 @@ def _extract_referenced_fields(obj, out: set[str] | None = None) -> set[str]:
     return out
 
 
+_QUERY_CLAUSE_KEYS = frozenset({
+    "term", "terms", "match", "match_phrase", "match_phrase_prefix",
+    "range", "prefix", "wildcard", "regexp", "fuzzy",
+})
+
+
+def _extract_clause_key_fields(obj, out: set[str] | None = None) -> set[str]:
+    """Collect field names used as query clause keys such as term/range/match."""
+    if out is None:
+        out = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in _QUERY_CLAUSE_KEYS and isinstance(value, dict):
+                if "field" in value:
+                    _extract_clause_key_fields(value, out)
+                    continue
+                for field_name in value:
+                    if isinstance(field_name, str):
+                        out.add(field_name)
+            elif key == "sort":
+                for item in value if isinstance(value, list) else [value]:
+                    if isinstance(item, dict):
+                        for field_name in item:
+                            if isinstance(field_name, str) and not field_name.startswith("_"):
+                                out.add(field_name)
+            _extract_clause_key_fields(value, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_clause_key_fields(item, out)
+    return out
+
+
 def _suggest_field(unknown: str, field_types: dict[str, str]) -> str | None:
     """Find the closest known field name via case-insensitive substring matching."""
     lower = unknown.lower().replace(".", "").replace("_", "")
@@ -334,7 +370,7 @@ def _check_unknown_fields(body: dict, field_types: dict[str, str]) -> list[str]:
     all_known = set(field_types.keys()) | {f + ".keyword" for f in field_types}
     # Also allow meta fields
     all_known |= {"_id", "_index", "_score", "_type", "@timestamp"}
-    used = _extract_referenced_fields(body)
+    used = _extract_referenced_fields(body) | _extract_clause_key_fields(body)
     return sorted(f for f in used if f not in all_known)
 
 
@@ -348,7 +384,10 @@ def _rewrite_unknown_fields(body: dict, field_types: dict[str, str]) -> dict[str
         return {}
     all_known = set(field_types.keys()) | {f + ".keyword" for f in field_types}
     all_known |= {"_id", "_index", "_score", "_type", "@timestamp"}
-    unknown = {f for f in _extract_referenced_fields(body) if f not in all_known}
+    unknown = {
+        f for f in (_extract_referenced_fields(body) | _extract_clause_key_fields(body))
+        if f not in all_known
+    }
     rewrites: dict[str, str] = {}
     for f in unknown:
         suggestion = _suggest_field(f, field_types)
@@ -364,6 +403,23 @@ def _apply_field_rewrites(obj, rewrites: dict[str, str]) -> None:
     if isinstance(obj, dict):
         if "field" in obj and obj["field"] in rewrites:
             obj["field"] = rewrites[obj["field"]]
+        for key, value in list(obj.items()):
+            if key in _QUERY_CLAUSE_KEYS and isinstance(value, dict):
+                for field_name in list(value.keys()):
+                    replacement = rewrites.get(field_name)
+                    if replacement and replacement != field_name:
+                        value[replacement] = value.pop(field_name)
+            elif key == "sort":
+                items = value if isinstance(value, list) else [value]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    for field_name in list(item.keys()):
+                        replacement = rewrites.get(field_name)
+                        if replacement and replacement != field_name:
+                            item[replacement] = item.pop(field_name)
+            elif key == "_source" and isinstance(value, list):
+                obj[key] = [rewrites.get(v, v) if isinstance(v, str) else v for v in value]
         for v in obj.values():
             _apply_field_rewrites(v, rewrites)
     elif isinstance(obj, list):
@@ -372,6 +428,8 @@ def _apply_field_rewrites(obj, rewrites: dict[str, str]) -> None:
 
 
 _THINKING_MODEL_PATTERNS = ("deepseek", "r1", "qwq", "thinking")
+_HASH_RE = re.compile(r"\b[a-fA-F0-9]{32,64}\b")
+_DOMAIN_RE = re.compile(r"\b(?=.{4,253}\b)(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,63}\b")
 
 
 def _supports_thinking(model: str) -> bool:
@@ -401,6 +459,765 @@ def _friendly_ollama_error(raw: str) -> str:
     if "does not support thinking" in msg:
         return f"Model does not support thinking mode: {msg}"
     return msg
+
+
+def _extract_indicator(query: str) -> tuple[str, str] | None:
+    """Extract an obvious hunt indicator from a natural-language query."""
+    for token in re.findall(r"[A-Fa-f0-9:.]{2,}", query):
+        candidate = token.strip(".,;()[]{}<>\"'")
+        if not candidate:
+            continue
+        try:
+            return ("ip", str(ipaddress.ip_address(candidate)))
+        except ValueError:
+            continue
+
+    hash_match = _HASH_RE.search(query)
+    if hash_match:
+        return ("hash", hash_match.group(0).lower())
+
+    for match in _DOMAIN_RE.finditer(query):
+        domain = match.group(0).lower()
+        if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", domain):
+            return ("domain", domain)
+    return None
+
+
+def _indicator_exact_field(field_name: str, field_type: str) -> str | None:
+    if field_type in {"keyword", "ip", "long", "integer", "float", "boolean"}:
+        return field_name
+    if field_type == "text+kw":
+        return field_name + ".keyword"
+    return None
+
+
+def _build_indicator_should_clause(field_name: str, field_type: str, indicator_type: str, value: str) -> dict | None:
+    exact_field = _indicator_exact_field(field_name, field_type)
+    if exact_field:
+        if indicator_type == "domain" and field_name == "url.original":
+            return {"wildcard": {field_name: {"value": f"*{value}*", "case_insensitive": True}}}
+        return {"term": {exact_field: value}}
+    if indicator_type == "domain" and field_type in {"text", "wildcard"}:
+        return {"wildcard": {field_name: {"value": f"*{value}*", "case_insensitive": True}}}
+    return None
+
+
+def _candidate_indicator_fields(field_types: dict[str, str], indicator_type: str) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    for field_name, field_type in field_types.items():
+        name = field_name.lower()
+        if indicator_type == "ip":
+            if field_type == "ip" or name.endswith(".ip") or "ipaddress" in name or name.endswith("ip"):
+                candidates.append((field_name, field_type))
+        elif indicator_type == "hash":
+            if "hash" in name and field_type in {"keyword", "text+kw", "wildcard"}:
+                candidates.append((field_name, field_type))
+        elif indicator_type == "domain":
+            if (
+                "domain" in name
+                or field_name in {"url.original", "host.name", "destination.domain", "source.domain"}
+            ):
+                candidates.append((field_name, field_type))
+    return candidates
+
+
+def _build_indicator_fast_path_query(
+    query: str,
+    field_types: dict[str, str],
+    max_results: int,
+) -> dict | None:
+    """Build a deterministic indicator-hunt query for obvious IP/hash/domain prompts."""
+    indicator = _extract_indicator(query)
+    if not indicator or not field_types:
+        return None
+
+    indicator_type, indicator_value = indicator
+    fields = _candidate_indicator_fields(field_types, indicator_type)
+    should = []
+    for field_name, field_type in fields:
+        clause = _build_indicator_should_clause(field_name, field_type, indicator_type, indicator_value)
+        if clause:
+            should.append(clause)
+    if not should:
+        return None
+
+    source_fields = []
+    for field_name in (
+        "@timestamp", "Timestamp", "TimeCreated",
+        "event.action", "event.code", "event.outcome",
+        "source.ip", "destination.ip", "SrcIP", "DestIP",
+        "process.name", "process.command_line", "Path",
+        "user.name", "UserName", "host.name", "Name", "Status", "Type",
+    ):
+        if field_name in field_types and field_name not in source_fields:
+            source_fields.append(field_name)
+
+    sort_fields = []
+    for field_name in ("@timestamp", "Timestamp", "TimeCreated", "event.created"):
+        if field_name in field_types:
+            sort_fields.append({field_name: {"order": "asc"}})
+    if not sort_fields:
+        sort_fields = [{"_score": "desc"}]
+
+    return {
+        "query": {
+            "bool": {
+                "should": should,
+                "minimum_should_match": 1,
+            }
+        },
+        "_source": source_fields or True,
+        "sort": sort_fields,
+        "size": max_results,
+    }
+
+
+def _build_field_list_fast_path_query(
+    query: str,
+    schema_profile: dict,
+    max_results: int,
+) -> dict | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    lower = query.lower()
+    if not any(token in lower for token in ("list", "show", "give me", "what are")):
+        return None
+    if "ip" not in lower:
+        return None
+    if _looks_like_counts_question(query):
+        return None
+
+    field_types = schema_profile.get("field_types", {})
+    target_field = None
+    if "destination" in lower or "dest " in lower or "destip" in lower:
+        target_field = _choose_role_field(schema_profile, "destination_ip")
+    elif "source" in lower or "src " in lower or "sourceip" in lower or "srcip" in lower:
+        target_field = _choose_role_field(schema_profile, "source_ip")
+    elif "host ip" in lower:
+        target_field = next((field for field in _choose_role_fields(schema_profile, "ip", 5) if "host" in _normalize_field_name(field)), None)
+
+    if not target_field:
+        return None
+
+    source_fields = [target_field]
+    if "@timestamp" in field_types:
+        source_fields.append("@timestamp")
+    elif "Timestamp" in field_types:
+        source_fields.append("Timestamp")
+    elif "TimeCreated" in field_types:
+        source_fields.append("TimeCreated")
+
+    return {
+        "query": {"exists": {"field": target_field}},
+        "_source": source_fields,
+        "size": max_results,
+    }
+
+
+_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?\b")
+
+
+def _extract_date_range(query: str) -> tuple[str, str] | None:
+    matches = _DATE_RE.findall(query)
+    if len(matches) < 2:
+        return None
+
+    values = []
+    for date_part, time_part in matches[:2]:
+        if time_part:
+            values.append(f"{date_part}T{time_part}Z")
+        else:
+            values.append(f"{date_part}T00:00:00Z")
+
+    start, end = values[0], values[1]
+    if start > end:
+        start, end = end, start
+    if end.endswith("T00:00:00Z"):
+        end = end.replace("T00:00:00Z", "T23:59:59Z")
+    return start, end
+
+
+def _pick_first_field(field_types: dict[str, str], candidates: tuple[str, ...]) -> str | None:
+    for field in candidates:
+        if field in field_types:
+            return field
+    return None
+
+
+_ROLE_RULES = {
+    "time": {
+        "types": {"date", "date_nanos"},
+        "keywords": ("time", "timestamp", "created", "modified", "access", "visit", "recordchange", "mtime"),
+    },
+    "user": {
+        "types": {"keyword", "text+kw", "text", "wildcard"},
+        "keywords": ("user", "account", "principal", "subject", "targetuser", "username", "logon"),
+    },
+    "host": {
+        "types": {"keyword", "text+kw", "text"},
+        "keywords": ("host", "computer", "device", "workstation", "machine"),
+    },
+    "ip": {
+        "types": {"ip"},
+        "keywords": ("ip", "address", "addr"),
+    },
+    "source_ip": {
+        "types": {"ip"},
+        "keywords": ("source", "src", "client", "remote", "origin", "workstation"),
+        "requires": ("ip",),
+    },
+    "destination_ip": {
+        "types": {"ip"},
+        "keywords": ("destination", "dest", "target", "server", "peer", "dst"),
+        "requires": ("ip",),
+    },
+    "url": {
+        "types": {"keyword", "text+kw", "text", "wildcard"},
+        "keywords": ("url", "uri", "visit", "website", "site", "history", "domain", "page", "title"),
+    },
+    "file_path": {
+        "types": {"keyword", "text+kw", "text", "wildcard"},
+        "keywords": ("path", "file", "name", "filename", "ospath", "link"),
+    },
+    "action": {
+        "types": {"keyword", "text+kw", "text", "wildcard"},
+        "keywords": ("action", "description", "message", "status", "operation", "outcome", "event", "type"),
+    },
+    "event_code": {
+        "types": {"keyword", "long", "integer"},
+        "keywords": ("eventid", "event", "code", "id"),
+    },
+    "outcome": {
+        "types": {"keyword", "text+kw", "text"},
+        "keywords": ("outcome", "result", "status", "failure", "success"),
+    },
+}
+
+
+def _normalize_field_name(field_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", field_name.lower()).strip()
+
+
+def _type_matches_role(field_type: str, allowed: set[str]) -> bool:
+    normalized = str(field_type).lower()
+    if normalized in allowed:
+        return True
+    if normalized.startswith("date") and "date" in allowed:
+        return True
+    return False
+
+
+def _score_field_for_role(field_name: str, field_type: str, sample: str, role: str) -> int:
+    rule = _ROLE_RULES[role]
+    normalized_name = _normalize_field_name(field_name)
+    condensed_name = normalized_name.replace(" ", "")
+    score = 0
+    matched_name = False
+    matched_type = False
+
+    if _type_matches_role(field_type, rule["types"]):
+        score += 4
+        matched_type = True
+
+    for kw in rule["keywords"]:
+        if kw in normalized_name or kw in condensed_name:
+            score += 3
+            matched_name = True
+
+    for kw in rule.get("requires", ()):
+        if kw in normalized_name or kw in condensed_name:
+            score += 2
+            matched_name = True
+        else:
+            return 0
+
+    if sample:
+        sample_lower = sample.lower()
+        sample_supports = False
+        if role in {"source_ip", "destination_ip", "ip"} and re.search(r"(?:\d{1,3}\.){3}\d{1,3}|:", sample_lower):
+            score += 2
+            sample_supports = True
+        if role == "url" and (sample_lower.startswith("http://") or sample_lower.startswith("https://")):
+            score += 3
+            sample_supports = True
+        if role == "time" and "t" in sample_lower and ":" in sample_lower:
+            score += 1
+            sample_supports = True
+        if sample_supports:
+            score += 2
+
+    allow_type_only = role in {"ip", "time"}
+    allow_sample_only = role in {"url"}
+    if not matched_name and not (allow_type_only and matched_type):
+        sample_text = sample.lower() if sample else ""
+        if not (allow_sample_only and (sample_text.startswith("http://") or sample_text.startswith("https://"))):
+            return 0
+
+    if role == "destination_ip" and any(term in normalized_name for term in ("source", "src", "client")):
+        score -= 3
+    if role == "source_ip" and any(term in normalized_name for term in ("destination", "dest", "target", "server")):
+        score -= 3
+    if role == "url" and "title" in normalized_name:
+        score -= 1
+
+    return score
+
+
+def _build_schema_profile(field_types: dict[str, str], samples: dict[str, str] | None = None) -> dict:
+    sample_values = samples or {}
+    roles: dict[str, list[str]] = {}
+    role_details: dict[str, list[dict[str, object]]] = {}
+    for role in _ROLE_RULES:
+        ranked: list[tuple[int, int, str]] = []
+        for field_name, field_type in field_types.items():
+            score = _score_field_for_role(field_name, field_type, sample_values.get(field_name, ""), role)
+            if score > 0:
+                ranked.append((score, 1 if sample_values.get(field_name) else 0, field_name))
+        ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        roles[role] = [field_name for _, _, field_name in ranked]
+        role_details[role] = [
+            {
+                "field": field_name,
+                "score": score,
+                "sample": sample_values.get(field_name, ""),
+                "type": field_types.get(field_name, ""),
+            }
+            for score, _, field_name in ranked
+        ]
+    return {
+        "field_types": field_types,
+        "samples": sample_values,
+        "roles": roles,
+        "role_details": role_details,
+    }
+
+
+def _ensure_schema_profile(schema_or_field_types) -> dict:
+    if isinstance(schema_or_field_types, dict) and "roles" in schema_or_field_types and "field_types" in schema_or_field_types:
+        return schema_or_field_types
+    if isinstance(schema_or_field_types, dict):
+        return _build_schema_profile(schema_or_field_types, {})
+    return _build_schema_profile({}, {})
+
+
+def _choose_role_field(schema_profile: dict, role: str) -> str | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    candidates = schema_profile.get("roles", {}).get(role, [])
+    return candidates[0] if candidates else None
+
+
+def _choose_role_fields(schema_profile: dict, role: str, limit: int = 5) -> list[str]:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    return list(schema_profile.get("roles", {}).get(role, [])[:limit])
+
+
+def _get_role_candidates(schema_profile: dict, role: str, limit: int = 5) -> list[dict[str, object]]:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    details = schema_profile.get("role_details", {}).get(role, [])
+    return [dict(item) for item in details[:limit]]
+
+
+def _role_label(role: str) -> str:
+    return role.replace("_", " ")
+
+
+def _build_clarification_message(
+    query: str,
+    role: str,
+    candidates: list[dict[str, object]],
+    reason: str,
+) -> dict[str, object]:
+    label = _role_label(role)
+    options = [str(item.get("field")) for item in candidates if item.get("field")]
+    summary = ", ".join(
+        f"{item['field']} ({item.get('type') or 'unknown'})"
+        for item in candidates[:3]
+        if item.get("field")
+    )
+    if options:
+        message = (
+            f"I’m not fully sure which {label} field to use for this question. "
+            f"I found: {summary}. Which one should I search?"
+        )
+    else:
+        message = (
+            f"I couldn’t find a confident {label} field for this question in the selected data. "
+            f"Please tell me which field I should use or choose a different data view."
+        )
+    return {
+        "message": message,
+        "reason": reason,
+        "query": query,
+        "role": role,
+        "options": options,
+    }
+
+
+def _resolve_role_field_for_planning(schema_profile: dict, role: str) -> tuple[str | None, dict[str, object] | None]:
+    candidates = _get_role_candidates(schema_profile, role, 4)
+    if not candidates:
+        return None, _build_clarification_message("", role, [], "missing_role")
+
+    top = candidates[0]
+    top_score = int(top.get("score", 0) or 0)
+    second_score = int(candidates[1].get("score", 0) or 0) if len(candidates) > 1 else 0
+
+    if role == "ip" and len(candidates) > 1:
+        return None, _build_clarification_message("", role, candidates, "generic_ip_role")
+    if top_score < 6:
+        return None, _build_clarification_message("", role, candidates, "low_confidence")
+    if len(candidates) > 1 and top_score - second_score <= 1 and top_score < 11:
+        return None, _build_clarification_message("", role, candidates, "ambiguous_role")
+    return str(top.get("field")), None
+
+
+def _maybe_build_semantic_clarification(
+    query: str,
+    indices: list[str],
+    schema_profile: dict,
+) -> dict[str, object] | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    intent = _parse_query_intent(query)
+    name = str(intent.get("name"))
+
+    roles_to_check: list[str] = []
+    if name in {"frequency_breakdown", "field_inventory"}:
+        role = str(intent.get("entity_role") or "")
+        if role:
+            roles_to_check.append(role)
+    elif name == "history_timeline":
+        roles_to_check.extend(["time", "url"])
+    elif name == "failed_login_accounts":
+        roles_to_check.append("user")
+    elif name == "file_timeline":
+        roles_to_check.append("time")
+
+    for role in roles_to_check:
+        field_name, clarification = _resolve_role_field_for_planning(schema_profile, role)
+        if clarification:
+            clarification["query"] = query
+            clarification["indices"] = indices
+            return clarification
+        if not field_name:
+            clarification = _build_clarification_message(query, role, _get_role_candidates(schema_profile, role, 4), "missing_role")
+            clarification["indices"] = indices
+            return clarification
+    return None
+
+
+def _looks_like_counts_question(query: str) -> bool:
+    lower = query.lower()
+    return (
+        "count" in lower
+        or "counts" in lower
+        or "top" in lower
+        or "most" in lower
+        or "how many" in lower
+        or "times they appear" in lower
+        or "times it appears" in lower
+    )
+
+
+def _parse_query_intent(query: str) -> dict[str, object]:
+    lower = query.lower()
+    date_range = _extract_date_range(query)
+
+    if _extract_indicator(query):
+        return {"name": "indicator_lookup", "date_range": date_range}
+    if "ip" in lower and _looks_like_counts_question(query):
+        role = "destination_ip" if ("destination" in lower or "dest " in lower or "destip" in lower) else (
+            "source_ip" if ("source" in lower or "src " in lower or "sourceip" in lower or "srcip" in lower) else "ip"
+        )
+        return {"name": "frequency_breakdown", "entity_role": role, "date_range": date_range}
+    if "ip" in lower and any(token in lower for token in ("list", "show", "give me", "what are")):
+        role = "destination_ip" if ("destination" in lower or "dest " in lower or "destip" in lower) else (
+            "source_ip" if ("source" in lower or "src " in lower or "sourceip" in lower or "srcip" in lower) else "ip"
+        )
+        return {"name": "field_inventory", "entity_role": role, "date_range": date_range}
+    if any(term in lower for term in ("failed login", "failed logon", "login failed", "logon failed", "accounts failed", "failed accounts")):
+        return {"name": "failed_login_accounts", "date_range": date_range}
+    if date_range and any(term in lower for term in ("website", "websites", "site", "sites", "visited", "history", "url", "urls")):
+        return {"name": "history_timeline", "date_range": date_range}
+    if date_range and any(term in lower for term in ("file", "files")) and any(term in lower for term in ("changed", "modified", "created", "accessed")):
+        return {"name": "file_timeline", "date_range": date_range}
+    return {"name": "generic_search", "date_range": date_range}
+
+
+def _build_ip_count_fast_path_query(
+    query: str,
+    schema_profile: dict,
+    max_results: int,
+) -> dict | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    lower = query.lower()
+    if "ip" not in lower or not _looks_like_counts_question(query):
+        return None
+
+    target_field = None
+    agg_name = None
+    if "destination" in lower or "dest " in lower or "destip" in lower:
+        target_field = _choose_role_field(schema_profile, "destination_ip")
+        agg_name = "by_destination_ip"
+    elif "source" in lower or "src " in lower or "sourceip" in lower or "srcip" in lower:
+        target_field = _choose_role_field(schema_profile, "source_ip")
+        agg_name = "by_source_ip"
+    elif "host ip" in lower:
+        target_field = next((field for field in _choose_role_fields(schema_profile, "ip", 5) if "host" in _normalize_field_name(field)), None)
+        agg_name = "by_host_ip"
+
+    if not target_field or not agg_name:
+        return None
+
+    return {
+        "query": {"exists": {"field": target_field}},
+        "aggs": {
+            agg_name: {
+                "terms": {
+                    "field": target_field,
+                    "size": min(max_results, 100),
+                    "order": {"_count": "desc"},
+                }
+            }
+        },
+        "size": 0,
+    }
+
+
+def _build_mft_between_dates_query(
+    query: str,
+    indices: list[str],
+    schema_profile: dict,
+    max_results: int,
+) -> dict | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    lower = query.lower()
+    if not any(idx.lower().startswith("windows.ntfs.mft") for idx in indices):
+        return None
+    if "between" not in lower and "from" not in lower:
+        return None
+    if not any(token in lower for token in ("file", "files", "changed", "modified", "created", "accessed")):
+        return None
+
+    date_range = _extract_date_range(query)
+    if not date_range:
+        return None
+    start, end = date_range
+    field_types = schema_profile.get("field_types", {})
+
+    if "created" in lower:
+        time_field = next((field for field in _choose_role_fields(schema_profile, "time", 10) if "created" in _normalize_field_name(field)), None)
+    elif "access" in lower:
+        time_field = next((field for field in _choose_role_fields(schema_profile, "time", 10) if "access" in _normalize_field_name(field)), None)
+    else:
+        time_field = next(
+            (
+                field for field in _choose_role_fields(schema_profile, "time", 12)
+                if any(term in _normalize_field_name(field) for term in ("modified", "mtime", "recordchange"))
+            ),
+            None,
+        )
+    if not time_field:
+        time_field = _choose_role_field(schema_profile, "time")
+    if not time_field:
+        return None
+
+    source_fields = [
+        field for field in (
+            "file.path", "file.name", "file.mtime", "file.created", "file.accessed",
+            "FileName", "OSPath", "host.name", "@timestamp",
+            "LastModified0x10", "LastModified0x30", "LastRecordChange0x10", "LastRecordChange0x30",
+        )
+        if field in field_types
+    ]
+
+    return {
+        "query": {"range": {time_field: {"gte": start, "lte": end}}},
+        "_source": source_fields or True,
+        "sort": [{time_field: {"order": "asc"}}],
+        "size": max_results,
+    }
+
+
+def _build_failed_login_accounts_query(
+    query: str,
+    indices: list[str],
+    schema_profile: dict,
+    max_results: int,
+) -> dict | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    lower = query.lower()
+    if not any(term in lower for term in ("failed login", "failed logon", "login failed", "logon failed", "accounts failed", "failed accounts")):
+        return None
+    if not any(term in lower for term in ("account", "accounts", "user", "users")):
+        return None
+    if not any(idx.lower().startswith("windows.eventlogs.evtx") or idx.lower().startswith("windows.eventlogs.rdpauth") for idx in indices):
+        return None
+
+    field_types = schema_profile.get("field_types", {})
+    user_field = _choose_role_field(schema_profile, "user")
+    if not user_field:
+        return None
+
+    should = []
+    if "event.code" in field_types:
+        should.append({"term": {"event.code": "4625"}})
+    if "EventID" in field_types:
+        should.append({"term": {"EventID": 4625}})
+    if "event.outcome" in field_types:
+        should.append({"term": {"event.outcome": "failure"}})
+    if "Description.keyword" in field_types:
+        should.append({"term": {"Description.keyword": "LOGON_FAILED"}})
+    elif "Description" in field_types:
+        should.append({"match": {"Description": "LOGON_FAILED"}})
+    if not should:
+        return None
+
+    body = {
+        "query": {"bool": {"should": should, "minimum_should_match": 1}},
+        "aggs": {
+            "by_account": {
+                "terms": {
+                    "field": user_field,
+                    "size": min(max_results, 100),
+                    "order": {"_count": "desc"},
+                }
+            }
+        },
+        "size": 0,
+    }
+
+    source_ip_field = _choose_role_field(schema_profile, "source_ip")
+    if source_ip_field:
+        body["aggs"]["by_account"]["aggs"] = {
+            "by_source_ip": {
+                "terms": {
+                    "field": source_ip_field,
+                    "size": 5,
+                    "order": {"_count": "desc"},
+                }
+            }
+        }
+    return body
+
+
+def _build_history_between_dates_query(
+    query: str,
+    indices: list[str],
+    schema_profile: dict,
+    max_results: int,
+) -> dict | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    lower = query.lower()
+    if not any(".history" in idx.lower() for idx in indices):
+        return None
+    if not any(term in lower for term in ("website", "websites", "site", "sites", "visited", "history", "url", "urls")):
+        return None
+
+    date_range = _extract_date_range(query)
+    if not date_range:
+        return None
+    start, end = date_range
+
+    field_types = schema_profile.get("field_types", {})
+    time_field = _choose_role_field(schema_profile, "time")
+    url_field = _choose_role_field(schema_profile, "url")
+    if not time_field or not url_field:
+        return None
+
+    source_fields = [
+        field for field in (
+            url_field, "title", time_field, "last_visit_time",
+            "user.name", "User", "host.name", "visit_count",
+        )
+        if field in field_types
+    ]
+
+    return {
+        "query": {"range": {time_field: {"gte": start, "lte": end}}},
+        "_source": source_fields or True,
+        "sort": [{time_field: {"order": "asc"}}],
+        "size": max_results,
+    }
+
+
+def _build_semantic_fast_path_query(
+    query: str,
+    indices: list[str],
+    schema_profile: dict,
+    max_results: int,
+) -> tuple[dict, str] | None:
+    schema_profile = _ensure_schema_profile(schema_profile)
+    intent = _parse_query_intent(query)
+    planner_map: dict[str, tuple[str, object]] = {
+        "frequency_breakdown": (
+            "Used built-in IP counting for a direct source/destination IP summary request.",
+            _build_ip_count_fast_path_query,
+        ),
+        "file_timeline": (
+            "Used built-in MFT timeline query for a file-change question between two dates.",
+            lambda q, f, m: _build_mft_between_dates_query(q, indices, f, m),
+        ),
+        "failed_login_accounts": (
+            "Used built-in failed-login account summary for an authentication question.",
+            lambda q, f, m: _build_failed_login_accounts_query(q, indices, f, m),
+        ),
+        "history_timeline": (
+            "Used built-in browser-history timeline query for a website activity question.",
+            lambda q, f, m: _build_history_between_dates_query(q, indices, f, m),
+        ),
+    }
+    planner = planner_map.get(str(intent.get("name")))
+    if planner:
+        reason, builder = planner
+        body = builder(query, schema_profile, max_results)
+        if body:
+            return body, reason
+    return None
+
+
+def _queries_equivalent(left: dict | list | None, right: dict | list | None) -> bool:
+    if left is None or right is None:
+        return False
+    try:
+        return json.dumps(left, sort_keys=True, separators=(",", ":")) == json.dumps(
+            right, sort_keys=True, separators=(",", ":")
+        )
+    except TypeError:
+        return left == right
+
+
+def _collect_referenced_fields(node: object, out: set[str]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "field" and isinstance(value, str):
+                out.add(value)
+            elif key in _QUERY_CLAUSE_KEYS and isinstance(value, dict):
+                for field_name in value.keys():
+                    if field_name != "value" and isinstance(field_name, str):
+                        out.add(field_name)
+            elif key == "_source" and isinstance(value, list):
+                out.update(field for field in value if isinstance(field, str))
+            _collect_referenced_fields(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_referenced_fields(item, out)
+
+
+def _build_zero_result_hint(indices: list[str], query_body: dict | list | None) -> str | None:
+    if not query_body:
+        return None
+    bodies = query_body if isinstance(query_body, list) else [query_body]
+    fields: set[str] = set()
+    for body in bodies:
+        _collect_referenced_fields(body, fields)
+
+    lower_indices = [idx.lower() for idx in indices]
+    if any(idx.startswith("windows.eventlogs.rdpauth") for idx in lower_indices):
+        if {"destination.ip", "DestIP", "destination.port"}.intersection(fields):
+            return (
+                "RDPAuth events in this dataset do not populate destination.* fields. "
+                "The remote client is recorded in source.ip instead."
+            )
+    return None
 
 
 def _sanitize_query_body(body: dict) -> dict:
@@ -883,7 +1700,55 @@ async def _smart_search(
     es = get_es_client()
 
     index_str = ", ".join(indices) if indices else "all indices"
-    fields_str, field_types = await _get_mapping_fields(es, indices)
+    mapping_info = await _get_mapping_fields(es, indices)
+    if len(mapping_info) == 3:
+        fields_str, field_types, samples = mapping_info
+    else:
+        fields_str, field_types = mapping_info
+        samples = await _get_field_samples(es, indices)
+    schema_profile = _build_schema_profile(field_types, samples)
+    fast_path_query = _build_indicator_fast_path_query(query, field_types, max_results)
+    if fast_path_query:
+        target = ",".join(indices) if indices else "_all"
+        try:
+            events = _sort_events(await _run_query(es, target, fast_path_query, max_results))
+            yield ("result", events, fast_path_query, "Used built-in indicator hunt for a direct IP/domain/hash lookup.")
+            return
+        except Exception as exc:
+            events = _sort_events(await _keyword_search(indices, query, max_results))
+            yield ("result", events, fast_path_query, f"Built-in indicator hunt failed ({exc}) — fell back to keyword search.")
+            return
+
+    clarification = _maybe_build_semantic_clarification(query, indices, schema_profile)
+    if clarification:
+        yield ("clarification", clarification)
+        return
+
+    semantic_fast_path = _build_semantic_fast_path_query(query, indices, schema_profile, max_results)
+    if semantic_fast_path:
+        semantic_query, semantic_reason = semantic_fast_path
+        target = ",".join(indices) if indices else "_all"
+        try:
+            events = _sort_events(await _run_query(es, target, semantic_query, max_results))
+            yield ("result", events, semantic_query, semantic_reason)
+            return
+        except Exception as exc:
+            events = _sort_events(await _keyword_search(indices, query, max_results))
+            yield ("result", events, semantic_query, f"{semantic_reason} Built-in planner failed ({exc}) — fell back to keyword search.")
+            return
+
+    field_list_query = _build_field_list_fast_path_query(query, schema_profile, max_results)
+    if field_list_query:
+        target = ",".join(indices) if indices else "_all"
+        try:
+            events = _sort_events(await _run_query(es, target, field_list_query, max_results))
+            yield ("result", events, field_list_query, "Used built-in field listing for a direct field inventory request.")
+            return
+        except Exception as exc:
+            events = _sort_events(await _keyword_search(indices, query, max_results))
+            yield ("result", events, field_list_query, f"Built-in field listing failed ({exc}) — fell back to keyword search.")
+            return
+
     system = QUERY_GEN_PROMPT.substitute(
         max_results=max_results,
         indices=index_str,
@@ -906,7 +1771,7 @@ async def _smart_search(
             else:
                 content_parts.append(text)
         if ollama_error:
-            events = await _keyword_search(indices, query, max_results)
+            events = _sort_events(await _keyword_search(indices, query, max_results))
             yield ("result", events, None, f"Query generation failed: {_friendly_ollama_error(ollama_error)} — fell back to keyword search.")
             return
         raw = "".join(content_parts)
@@ -916,24 +1781,24 @@ async def _smart_search(
     parsed = _extract_json(raw)
 
     if not parsed or ("query" not in parsed and "queries" not in parsed):
-        events = await _keyword_search(indices, query, max_results)
+        events = _sort_events(await _keyword_search(indices, query, max_results))
         detail = raw[:500] if raw.strip() else "(model returned no output — possible OOM or context overflow)"
         yield ("result", events, None, f"LLM did not return valid query JSON — fell back to keyword search.\n\nLLM output:\n{detail}")
         return
 
-    target = ",".join(indices[:20]) if indices else "_all"
+    target = ",".join(indices) if indices else "_all"
 
     if "queries" in parsed:
         # ── Multiple queries — run in parallel ──────────────────────────────────
         raw_queries = parsed["queries"]
         if not isinstance(raw_queries, list) or not raw_queries:
-            events = await _keyword_search(indices, query, max_results)
+            events = _sort_events(await _keyword_search(indices, query, max_results))
             yield ("result", events, None, "LLM returned empty queries list — fell back to keyword search.")
             return
 
         valid_raw = [qb for qb in raw_queries[:3] if isinstance(qb, dict)]
         if not valid_raw:
-            events = await _keyword_search(indices, query, max_results)
+            events = _sort_events(await _keyword_search(indices, query, max_results))
             yield ("result", events, None, "No valid query objects in LLM response — fell back to keyword search.")
             return
 
@@ -973,7 +1838,7 @@ async def _smart_search(
                     yield ("query_progress", completed, total, 0)
 
         if not valid_bodies:
-            events = await _keyword_search(indices, query, max_results)
+            events = _sort_events(await _keyword_search(indices, query, max_results))
             yield ("result", events, None, f"All generated queries failed — fell back to keyword search. {'; '.join(errors)}")
             return
 
@@ -998,7 +1863,7 @@ async def _smart_search(
                 for f in sorted(set(unknown_fields))
             ))
         fallback = "\n\n".join(parts) if parts else None
-        yield ("result", deduped[:max_results], valid_bodies, fallback)
+        yield ("result", _sort_events(deduped)[:max_results], valid_bodies, fallback)
 
     else:
         # ── Single query ────────────────────────────────────────────────────────
@@ -1016,11 +1881,42 @@ async def _smart_search(
                 for f in sorted(still_unknown)
             ))
         unknown_warn = ("\n\n" + "\n\n".join(warn_parts)) if warn_parts else None
+        if fast_path_query and still_unknown and not _queries_equivalent(parsed, fast_path_query):
+            try:
+                events = _sort_events(await _run_query(es, target, fast_path_query, max_results))
+                rescue_note = "Used built-in indicator hunt because the generated query referenced unresolved field names."
+                if unknown_warn:
+                    rescue_note = f"{rescue_note}{unknown_warn}"
+                yield ("result", events, fast_path_query, rescue_note)
+                return
+            except Exception:
+                pass
         try:
-            events = await _run_query(es, target, parsed, max_results)
+            events = _sort_events(await _run_query(es, target, parsed, max_results))
+            if fast_path_query and not events and not _queries_equivalent(parsed, fast_path_query):
+                try:
+                    rescue_events = _sort_events(await _run_query(es, target, fast_path_query, max_results))
+                    if rescue_events:
+                        rescue_note = "Used built-in indicator hunt because the generated query returned no matching records."
+                        if unknown_warn:
+                            rescue_note = f"{rescue_note}{unknown_warn}"
+                        yield ("result", rescue_events, fast_path_query, rescue_note)
+                        return
+                except Exception:
+                    pass
             yield ("result", events, parsed, unknown_warn)
         except Exception as exc:
-            events = await _keyword_search(indices, query, max_results)
+            if fast_path_query and not _queries_equivalent(parsed, fast_path_query):
+                try:
+                    events = _sort_events(await _run_query(es, target, fast_path_query, max_results))
+                    rescue_note = f"Generated query failed ({exc}) — used built-in indicator hunt instead."
+                    if unknown_warn:
+                        rescue_note = f"{rescue_note}{unknown_warn}"
+                    yield ("result", events, fast_path_query, rescue_note)
+                    return
+                except Exception:
+                    pass
+            events = _sort_events(await _keyword_search(indices, query, max_results))
             yield ("result", events, parsed, f"Generated query failed ({exc}) — fell back to keyword search.\n\nFailing query: {json.dumps(parsed, separators=(',', ':'))[:400]}{unknown_warn or ''}")
 
 
@@ -1039,7 +1935,7 @@ async def _keyword_search(indices: list[str], query: str, max_results: int) -> l
         return []
     try:
         result = await es.search(
-            index=",".join(indices[:20]),
+            index=",".join(indices),
             body={
                 "query": {
                     "multi_match": {
@@ -1077,6 +1973,249 @@ def _build_context_block(events: list[dict]) -> str:
         entry = f"\n[Event {i}] {json.dumps(compact, separators=(',', ':'))}\n"
         if used + len(entry) > _MAX_CONTEXT_CHARS:
             lines.append(f"\n[…{len(events) - included} more event(s) omitted — reduce result count or narrow your query]\n")
+            break
+        lines.append(entry)
+        used += len(entry)
+        included += 1
+    return "".join(lines)
+
+
+_MAX_EVIDENCE_EXAMPLES = 5
+
+
+def _get_value(obj: dict, field: str):
+    """Read a field from a flat event or a nested dotted path."""
+    if field in obj:
+        return obj[field]
+    current = obj
+    for part in field.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _pick_value(obj: dict, candidates: tuple[str, ...]):
+    for field in candidates:
+        value = _get_value(obj, field)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _infer_field_type_from_value(value) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "long"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return "text"
+        if ("-" in text or "T" in text or ":" in text) and re.search(r"\d{4}-\d{2}-\d{2}", text):
+            try:
+                datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return "date"
+            except ValueError:
+                pass
+        if text.startswith("http://") or text.startswith("https://"):
+            return "wildcard"
+        return "text+kw"
+    return "text"
+
+
+def _collect_event_schema(obj, prefix: str, field_types: dict[str, str], samples: dict[str, str]) -> None:
+    if not isinstance(obj, dict):
+        return
+    for key, value in obj.items():
+        field_name = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            _collect_event_schema(value, field_name, field_types, samples)
+        elif isinstance(value, list):
+            if value and isinstance(value[0], dict):
+                _collect_event_schema(value[0], field_name, field_types, samples)
+            elif value and field_name not in field_types:
+                field_types[field_name] = _infer_field_type_from_value(value[0])
+                samples[field_name] = str(value[0])[:120]
+        elif value not in (None, "", [], {}):
+            if field_name not in field_types:
+                field_types[field_name] = _infer_field_type_from_value(value)
+                samples[field_name] = str(value)[:120]
+
+
+def _build_event_schema_profile(events: list[dict]) -> dict:
+    field_types: dict[str, str] = {}
+    samples: dict[str, str] = {}
+    for event in events[:20]:
+        _collect_event_schema(event, "", field_types, samples)
+    return _build_schema_profile(field_types, samples)
+
+
+def _is_aggregate_row(event: dict) -> bool:
+    if not isinstance(event, dict):
+        return False
+    keys = set(event.keys())
+    if "count" not in keys:
+        return False
+    non_count = [k for k in keys if k != "count"]
+    return bool(non_count) and all(k.startswith("by_") or k in {"count"} for k in keys)
+
+
+def _build_aggregate_evidence_summary(events: list[dict]) -> str | None:
+    if not events or not all(_is_aggregate_row(event) for event in events):
+        return None
+    first = events[0]
+    group_fields = [k for k in first.keys() if k != "count"]
+    lines = [f"- Matching groups: {len(events)}"]
+    if group_fields:
+        lines.append(f"- Grouped by: {', '.join(group_fields)}")
+    top = events[: min(len(events), _MAX_EVIDENCE_EXAMPLES)]
+    for idx, row in enumerate(top, 1):
+        lines.append(f"- Row {idx}: {json.dumps(row, separators=(',', ':'))}")
+    return "\n".join(lines) + "\n"
+
+
+def _coerce_timestamp(value) -> tuple[float | None, str | None]:
+    if value in (None, ""):
+        return None, None
+    if isinstance(value, (int, float)):
+        dt = datetime.utcfromtimestamp(value / 1000 if value > 10_000_000_000 else value)
+        return dt.timestamp(), dt.isoformat() + "Z"
+    if not isinstance(value, str):
+        return None, str(value)
+    text = value.strip()
+    if not text:
+        return None, None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.timestamp(), text
+    except ValueError:
+        return None, text
+
+
+def _event_sort_key(event: dict) -> tuple[int, float, str]:
+    schema_profile = _build_event_schema_profile([event])
+    time_field = _choose_role_field(schema_profile, "time")
+    raw_ts = _get_value(event, time_field) if time_field else None
+    epoch, text = _coerce_timestamp(raw_ts)
+    if epoch is None:
+        return (1, 0.0, json.dumps(event, sort_keys=True))
+    return (0, epoch, text or "")
+
+
+def _sort_events(events: list[dict]) -> list[dict]:
+    return sorted(events, key=_event_sort_key)
+
+
+def _event_glimpse(event: dict, schema_profile: dict) -> dict:
+    glimpse: dict[str, object] = {}
+    for label, role in (
+        ("time", "time"),
+        ("action", "action"),
+        ("user", "user"),
+        ("host", "host"),
+        ("ip", "ip"),
+        ("artifact", "url"),
+    ):
+        field_name = _choose_role_field(schema_profile, role)
+        value = _get_value(event, field_name) if field_name else None
+        if value not in (None, "", [], {}):
+            glimpse[label] = value
+    if not glimpse:
+        for key in list(event.keys())[:4]:
+            glimpse[key] = event[key]
+    return glimpse
+
+
+def _format_top(counter: Counter, limit: int = 5) -> str:
+    if not counter:
+        return "none"
+    return ", ".join(f"{value} ({count})" for value, count in counter.most_common(limit))
+
+
+def _build_evidence_summary(events: list[dict], user_query: str = "") -> str:
+    if not events:
+        return "- No matching records were retrieved.\n"
+    aggregate_summary = _build_aggregate_evidence_summary(events)
+    if aggregate_summary:
+        return aggregate_summary
+
+    ordered = _sort_events(events)
+    schema_profile = _build_event_schema_profile(ordered)
+    time_field = _choose_role_field(schema_profile, "time")
+    action_field = _choose_role_field(schema_profile, "action")
+    user_field = _choose_role_field(schema_profile, "user")
+    host_field = _choose_role_field(schema_profile, "host")
+    ip_field = _choose_role_field(schema_profile, "ip")
+
+    first_time = _get_value(ordered[0], time_field) if time_field else None
+    last_time = _get_value(ordered[-1], time_field) if time_field else None
+
+    action_counts = Counter()
+    user_counts = Counter()
+    host_counts = Counter()
+    ip_counts = Counter()
+    for event in ordered:
+        for counter, field_name in (
+            (action_counts, action_field),
+            (user_counts, user_field),
+            (host_counts, host_field),
+            (ip_counts, ip_field),
+        ):
+            value = _get_value(event, field_name) if field_name else None
+            if value not in (None, "", [], {}):
+                counter[str(value)] += 1
+
+    lines = [
+        f"- Matching records: {len(events)}",
+        f"- First seen: {first_time or 'unknown'}",
+        f"- Last seen: {last_time or 'unknown'}",
+        f"- Top actions: {_format_top(action_counts, 4)}",
+        f"- Top users: {_format_top(user_counts, 4)}",
+        f"- Top hosts: {_format_top(host_counts, 4)}",
+        f"- Top IPs: {_format_top(ip_counts, 4)}",
+    ]
+
+    if user_query:
+        query_ips = sorted(set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_query)))
+        if query_ips:
+            matches = {ip: ip_counts[ip] for ip in query_ips if ip in ip_counts}
+            if matches:
+                lines.append(
+                    "- Queried indicator matches: " +
+                    ", ".join(f"{ip} ({count})" for ip, count in sorted(matches.items()))
+                )
+
+    for idx, event in enumerate(ordered[:_MAX_EVIDENCE_EXAMPLES], 1):
+        lines.append(f"- Example {idx}: {json.dumps(_event_glimpse(event, schema_profile), separators=(',', ':'))}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_context_block(events: list[dict], user_query: str = "") -> str:
+    if not events:
+        return (
+            "\n\n--- Evidence summary ---\n"
+            "- No matching log events found in Elasticsearch for this query.\n"
+        )
+
+    ordered = _sort_events(events)
+    lines = [
+        "\n\n--- Evidence summary ---\n",
+        _build_evidence_summary(ordered, user_query),
+        f"\n--- {len(ordered)} log event(s) retrieved from Elasticsearch ---\n",
+    ]
+    used = sum(len(part) for part in lines)
+    included = 0
+    for i, event in enumerate(ordered, 1):
+        compact = {
+            k: (v[:300] + "â€¦" if isinstance(v, str) and len(v) > 300 else v)
+            for k, v in event.items()
+        }
+        entry = f"\n[Event {i}] {json.dumps(compact, separators=(',', ':'))}\n"
+        if used + len(entry) > _MAX_CONTEXT_CHARS:
+            lines.append(f"\n[â€¦{len(ordered) - included} more event(s) omitted â€” reduce result count or narrow your query]\n")
             break
         lines.append(entry)
         used += len(entry)
@@ -1279,6 +2418,360 @@ async def _stream_openai(model: str, messages: list[dict]):
                         yield ("content", text, False, {})
 
 
+def _eql_quote(value) -> str:
+    return json.dumps(value)
+
+
+def _translate_eql_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value is None:
+        return "null"
+    return _eql_quote(str(value))
+
+
+def _esql_identifier(field: str) -> str:
+    return f"`{field}`" if field.startswith("@") else field
+
+
+def _translate_esql_condition(query: dict) -> str | None:
+    if not isinstance(query, dict) or len(query) != 1:
+        return None
+    key, value = next(iter(query.items()))
+
+    if key == "match_all":
+        return None
+    if key == "exists" and isinstance(value, dict):
+        field = value.get("field")
+        return f"{_esql_identifier(field)} IS NOT NULL" if isinstance(field, str) else None
+    if key == "term" and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        return f"{_esql_identifier(field)} == {_translate_eql_value(field_value)}"
+    if key == "terms" and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        if isinstance(field_value, list):
+            joined = ", ".join(_translate_eql_value(v) for v in field_value)
+            return f"{_esql_identifier(field)} IN ({joined})"
+        return f"{_esql_identifier(field)} == {_translate_eql_value(field_value)}"
+    if key == "match" and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        if isinstance(field_value, dict):
+            field_value = field_value.get("query")
+        return f"{_esql_identifier(field)} LIKE {_translate_eql_value(f'*{field_value}*')}" if field_value is not None else None
+    if key in ("wildcard", "prefix") and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        if isinstance(field_value, dict):
+            field_value = field_value.get("value")
+        pattern = str(field_value)
+        if key == "prefix":
+            pattern = pattern + "*"
+        return f"{_esql_identifier(field)} LIKE {_translate_eql_value(pattern)}"
+    if key == "range" and isinstance(value, dict) and len(value) == 1:
+        field, spec = next(iter(value.items()))
+        if not isinstance(spec, dict):
+            return None
+        parts = []
+        for op, esql_op in (("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")):
+            if op in spec:
+                parts.append(f"{_esql_identifier(field)} {esql_op} {_translate_eql_value(spec[op])}")
+        return " AND ".join(parts) if parts else None
+    if key == "bool" and isinstance(value, dict):
+        clauses = []
+        must = value.get("must", [])
+        if isinstance(must, dict):
+            must = [must]
+        for clause in must:
+            translated = _translate_esql_condition(clause)
+            if translated:
+                clauses.append(translated)
+        filters = value.get("filter", [])
+        if isinstance(filters, dict):
+            filters = [filters]
+        for clause in filters:
+            translated = _translate_esql_condition(clause)
+            if translated:
+                clauses.append(translated)
+        should = value.get("should", [])
+        if isinstance(should, dict):
+            should = [should]
+        should_parts = [t for t in (_translate_esql_condition(clause) for clause in should) if t]
+        if should_parts:
+            should_expr = " OR ".join(should_parts)
+            clauses.append(f"({should_expr})" if len(should_parts) > 1 else should_expr)
+        must_not = value.get("must_not", [])
+        if isinstance(must_not, dict):
+            must_not = [must_not]
+        for clause in must_not:
+            translated = _translate_esql_condition(clause)
+            if translated:
+                clauses.append(f"NOT ({translated})")
+        return " AND ".join(clauses) if clauses else None
+    return None
+
+
+def _translate_esql_sort(body: dict) -> str:
+    sort_spec = body.get("sort")
+    if not isinstance(sort_spec, list) or not sort_spec:
+        return ""
+    parts = []
+    for entry in sort_spec:
+        if isinstance(entry, str):
+            parts.append(f"{_esql_identifier(entry)} ASC")
+        elif isinstance(entry, dict) and len(entry) == 1:
+            field, spec = next(iter(entry.items()))
+            if field == "_score":
+                continue
+            if isinstance(spec, dict):
+                order = str(spec.get("order", "asc")).upper()
+            else:
+                order = str(spec).upper()
+            parts.append(f"{_esql_identifier(field)} {order}")
+    return f" | SORT {', '.join(parts)}" if parts else ""
+
+
+def _deterministic_query_body_to_esql(query_body: dict, indices: list[str]) -> str | None:
+    if not isinstance(query_body, dict) or not indices:
+        return None
+    body = json.loads(json.dumps(query_body))
+    body = _sanitize_query_body(body)
+    source = ", ".join(indices)
+    segments = [f"FROM {source}"]
+
+    condition = _translate_esql_condition(body.get("query", {"match_all": {}}))
+    if condition:
+        segments.append(f"| WHERE {condition}")
+
+    aggs = body.get("aggs") or body.get("aggregations")
+    if aggs and isinstance(aggs, dict) and len(aggs) == 1:
+        _, agg_def = next(iter(aggs.items()))
+        if isinstance(agg_def, dict):
+            if "terms" in agg_def and isinstance(agg_def["terms"], dict):
+                field = agg_def["terms"].get("field")
+                size = agg_def["terms"].get("size")
+                order = agg_def["terms"].get("order", {})
+                if isinstance(field, str):
+                    segments.append(f"| STATS count = COUNT(*) BY {_esql_identifier(field)}")
+                    if isinstance(order, dict) and str(order.get("_count", "")).lower() == "desc":
+                        segments.append("| SORT count DESC")
+                    if isinstance(size, int) and size > 0:
+                        segments.append(f"| LIMIT {size}")
+                    return " ".join(segments)
+            if "composite" in agg_def and isinstance(agg_def["composite"], dict):
+                sources = agg_def["composite"].get("sources", [])
+                fields = []
+                for source_def in sources:
+                    if not isinstance(source_def, dict):
+                        return None
+                    for entry in source_def.values():
+                        if not isinstance(entry, dict):
+                            return None
+                        terms = entry.get("terms")
+                        field = terms.get("field") if isinstance(terms, dict) else None
+                        if not isinstance(field, str):
+                            return None
+                        fields.append(_esql_identifier(field))
+                if fields:
+                    segments.append(f"| STATS count = COUNT(*) BY {', '.join(fields)}")
+                    size = agg_def["composite"].get("size")
+                    if isinstance(size, int) and size > 0:
+                        segments.append(f"| LIMIT {size}")
+                    return " ".join(segments)
+
+    source_fields = body.get("_source")
+    if isinstance(source_fields, list) and source_fields:
+        keep_fields = [field for field in source_fields if isinstance(field, str)]
+        if keep_fields:
+            segments.append(f"| KEEP {', '.join(_esql_identifier(field) for field in keep_fields)}")
+
+    sort_clause = _translate_esql_sort(body)
+    if sort_clause:
+        segments.append(sort_clause)
+
+    size = body.get("size")
+    if isinstance(size, int) and size > 0:
+        segments.append(f"| LIMIT {size}")
+    return " ".join(segments)
+
+
+def _translate_eql_condition(query: dict) -> str | None:
+    if not isinstance(query, dict) or len(query) != 1:
+        return None
+    key, value = next(iter(query.items()))
+
+    if key == "match_all":
+        return "true"
+    if key == "exists" and isinstance(value, dict):
+        field = value.get("field")
+        return f"{field} != null" if isinstance(field, str) else None
+    if key == "term" and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        return f"{field} == {_translate_eql_value(field_value)}"
+    if key == "terms" and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        if isinstance(field_value, list):
+            joined = ", ".join(_translate_eql_value(v) for v in field_value)
+            return f"{field} in ({joined})"
+        return f"{field} == {_translate_eql_value(field_value)}"
+    if key == "match" and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        if isinstance(field_value, dict):
+            field_value = field_value.get("query")
+        return f"{field} : {_translate_eql_value(field_value)}" if field_value is not None else None
+    if key in ("wildcard", "prefix") and isinstance(value, dict) and len(value) == 1:
+        field, field_value = next(iter(value.items()))
+        if isinstance(field_value, dict):
+            field_value = field_value.get("value")
+        pattern = str(field_value)
+        if key == "prefix":
+            pattern = pattern + "*"
+        return f"{field} like~ {_translate_eql_value(pattern)}"
+    if key == "range" and isinstance(value, dict) and len(value) == 1:
+        field, spec = next(iter(value.items()))
+        if not isinstance(spec, dict):
+            return None
+        parts = []
+        for op, eql_op in (("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")):
+            if op in spec:
+                parts.append(f"{field} {eql_op} {_translate_eql_value(spec[op])}")
+        return " and ".join(parts) if parts else None
+    if key == "bool" and isinstance(value, dict):
+        clauses = []
+        must = value.get("must", [])
+        if isinstance(must, dict):
+            must = [must]
+        for clause in must:
+            translated = _translate_eql_condition(clause)
+            if translated:
+                clauses.append(translated)
+        filters = value.get("filter", [])
+        if isinstance(filters, dict):
+            filters = [filters]
+        for clause in filters:
+            translated = _translate_eql_condition(clause)
+            if translated:
+                clauses.append(translated)
+        should = value.get("should", [])
+        if isinstance(should, dict):
+            should = [should]
+        should_parts = [t for t in (_translate_eql_condition(clause) for clause in should) if t]
+        if should_parts:
+            should_expr = " or ".join(should_parts)
+            clauses.append(f"({should_expr})" if len(should_parts) > 1 else should_expr)
+        must_not = value.get("must_not", [])
+        if isinstance(must_not, dict):
+            must_not = [must_not]
+        for clause in must_not:
+            translated = _translate_eql_condition(clause)
+            if translated:
+                clauses.append(f"not ({translated})")
+        return " and ".join(clauses) if clauses else "true"
+    return None
+
+
+def _translate_eql_pipe(body: dict) -> str:
+    aggs = body.get("aggs") or body.get("aggregations")
+    if aggs and isinstance(aggs, dict) and len(aggs) == 1:
+        _, agg_def = next(iter(aggs.items()))
+        if isinstance(agg_def, dict):
+            if "terms" in agg_def and isinstance(agg_def["terms"], dict):
+                field = agg_def["terms"].get("field")
+                if isinstance(field, str):
+                    return f" | stats count() by {field}"
+            if "composite" in agg_def and isinstance(agg_def["composite"], dict):
+                sources = agg_def["composite"].get("sources", [])
+                fields = []
+                for source in sources:
+                    if not isinstance(source, dict):
+                        return ""
+                    for source_def in source.values():
+                        if not isinstance(source_def, dict) or "terms" not in source_def:
+                            return ""
+                        field = source_def["terms"].get("field")
+                        if not isinstance(field, str):
+                            return ""
+                        fields.append(field)
+                if fields:
+                    return f" | stats count() by {', '.join(fields)}"
+
+    size = body.get("size")
+    if isinstance(size, int) and size > 0:
+        return f" | head {size}"
+    return ""
+
+
+def _deterministic_query_body_to_eql(query_body: dict) -> str | None:
+    if not isinstance(query_body, dict):
+        return None
+    body = json.loads(json.dumps(query_body))
+    body = _sanitize_query_body(body)
+    query = body.get("query", {"match_all": {}})
+    condition = _translate_eql_condition(query)
+    if not condition:
+        return None
+    return f"any where {condition}{_translate_eql_pipe(body)}".strip()
+
+
+async def _convert_query_body_to_eql(provider: str, model: str, query_body: dict) -> str:
+    """Convert an ES DSL body to EQL, preferring a deterministic fallback."""
+    deterministic = _deterministic_query_body_to_eql(query_body)
+    if deterministic:
+        return deterministic
+    query_json = json.dumps(query_body, indent=2)
+    eql = await _llm_complete(
+        provider,
+        model,
+        system=_EQL_SYSTEM,
+        user=f"Convert this ES DSL query to EQL:\n{query_json}",
+    )
+    eql = re.sub(r'^```(?:eql|sql)?\s*', '', eql.strip(), flags=re.IGNORECASE)
+    eql = re.sub(r'\s*```$', '', eql.strip())
+    return eql.strip()
+
+
+async def _convert_query_body_to_kibana_query(
+    provider: str,
+    model: str,
+    query_body: dict,
+    indices: list[str],
+) -> dict:
+    esql = _deterministic_query_body_to_esql(query_body, indices)
+    if esql:
+        return {"language": "esql", "query": esql}
+
+    eql = await _convert_query_body_to_eql(provider, model, query_body)
+    return {"language": "eql", "query": eql}
+
+
+async def _convert_query_artifacts_to_kibana_queries(
+    provider: str,
+    model: str,
+    query_artifact,
+    indices: list[str],
+):
+    """Return [{query_index, language, query}] for the executed query or queries."""
+    if not query_artifact:
+        return []
+    bodies = query_artifact if isinstance(query_artifact, list) else [query_artifact]
+    query_results = []
+    for idx, body in enumerate(bodies, 1):
+        if not isinstance(body, dict):
+            continue
+        try:
+            kibana_query = await _convert_query_body_to_kibana_query(provider, model, body, indices)
+            query_results.append({
+                "query_index": idx,
+                **kibana_query,
+            })
+        except Exception as exc:
+            query_results.append({
+                "query_index": idx,
+                "error": str(exc),
+            })
+    return query_results
+
+
 @router.get("/personas")
 async def list_personas(_: dict = Depends(require_auth)):
     return [{"id": k, "label": v["label"]} for k, v in PERSONAS.items()]
@@ -1314,6 +2807,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                 events: list[dict] = []
                 query_body = None
                 fallback_reason = None
+                clarification = None
                 async for item in _smart_search(provider, model, indices, req.query, req.max_results):
                     if item[0] == "debug_query_prompt":
                         yield f"data: {json.dumps({'debug_query_prompt': {'system': item[1], 'user': item[2]}})}\n\n"
@@ -1322,6 +2816,8 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                     elif item[0] == "query_progress":
                         _, done, total, count = item
                         yield f"data: {json.dumps({'query_progress': {'done': done, 'total': total, 'count': count}})}\n\n"
+                    elif item[0] == "clarification":
+                        clarification = item[1]
                     elif item[0] == "result":
                         events, query_body, fallback_reason = item[1], item[2], item[3]
             except httpx.TimeoutException:
@@ -1331,18 +2827,32 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                 yield f"data: {json.dumps({'error': f'Query generation failed: {exc}'})}\n\n"
                 return
 
+            if clarification:
+                yield f"data: {json.dumps({'status': 'clarification_needed'})}\n\n"
+                yield f"data: {json.dumps({'clarification': clarification})}\n\n"
+                return
+
             if query_body:
                 yield f"data: {json.dumps({'generated_query': query_body})}\n\n"
+                yield f"data: {json.dumps({'status': 'converting_query'})}\n\n"
+                kibana_queries = await _convert_query_artifacts_to_kibana_queries(provider, model, query_body, indices)
+                if kibana_queries:
+                    yield f"data: {json.dumps({'generated_eql': kibana_queries})}\n\n"
             if fallback_reason:
                 yield f"data: {json.dumps({'query_warning': fallback_reason})}\n\n"
+            zero_result_hint = _build_zero_result_hint(indices, query_body)
+            if zero_result_hint and not events:
+                yield f"data: {json.dumps({'query_warning': zero_result_hint})}\n\n"
 
             yield f"data: {json.dumps({'status': 'found', 'count': len(events)})}\n\n"
         else:
             # ── Keyword search path ─────────────────────────────────────────────
             yield f"data: {json.dumps({'status': 'searching', 'indices': len(req.indices)})}\n\n"
-            events = await _keyword_search(indices, req.query, req.max_results)
+            events = _sort_events(await _keyword_search(indices, req.query, req.max_results))
             yield f"data: {json.dumps({'status': 'found', 'count': len(events)})}\n\n"
 
+        evidence_summary = _build_evidence_summary(events, req.query)
+        yield f"data: {json.dumps({'evidence_summary': evidence_summary})}\n\n"
         yield f"data: {json.dumps({'context': events})}\n\n"
 
         # ── Phase 1b: threat intel enrichment (optional) ────────────────────────
@@ -1371,7 +2881,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                 yield f"data: {json.dumps({'enrich_status': f'enriched {len(enrichments)} IP(s)'})}\n\n"
 
         # ── Phase 2: analyse with LLM ───────────────────────────────────────────
-        context_block = _build_context_block(events) + enrichment_context
+        context_block = _build_context_block(events, req.query) + enrichment_context
         persona_prompt = PERSONAS.get(req.persona or _DEFAULT_PERSONA, PERSONAS[_DEFAULT_PERSONA])["prompt"]
         messages: list[dict] = [{"role": "system", "content": persona_prompt}]
         if req.conversation_history:
@@ -1514,19 +3024,14 @@ DSL aggs composite     → | stats count() by field1, field2"""
 
 @router.post("/eql")
 async def convert_to_eql(req: EqlRequest, _: dict = Depends(require_auth)):
-    """Convert an ES DSL query body to EQL via the LLM."""
+    """Convert an ES DSL query body to a Kibana-ready query."""
     provider = req.provider or "ollama"
     model = req.model or settings.ollama_model
-    query_json = json.dumps(req.query_body, indent=2)
     try:
-        eql = await _llm_complete(
-            provider, model,
-            system=_EQL_SYSTEM,
-            user=f"Convert this ES DSL query to EQL:\n{query_json}",
-        )
-        # Strip markdown fences if model wrapped it
-        eql = re.sub(r'^```(?:eql|sql)?\s*', '', eql.strip(), flags=re.IGNORECASE)
-        eql = re.sub(r'\s*```$', '', eql.strip())
-        return {"eql": eql.strip()}
+        kibana_query = await _convert_query_body_to_kibana_query(provider, model, req.query_body, req.indices)
+        response = dict(kibana_query)
+        if kibana_query.get("language") == "eql":
+            response["eql"] = kibana_query.get("query", "")
+        return response
     except Exception as exc:
         return {"error": str(exc)}

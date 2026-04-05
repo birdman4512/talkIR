@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     es_ca_cert_path: str = "/certs/ca/ca.crt"
 
     ollama_host: str = "http://ollama:11434"
-    ollama_model: str = "llama3.2:3b"
+    ollama_model: str = "qwen2.5:7b"
 
     anthropic_api_key: str = ""
     openai_api_key: str = ""

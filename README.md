@@ -47,7 +47,7 @@ Chat with your logs using a local or cloud LLM. Drop JSON log files into `./logs
 ## Prerequisites
 
 - Docker ≥ 24 and Docker Compose ≥ 2.20
-- 2 GB RAM free for `llama3.2:3b` (the default model); 5 GB for 7B models
+- 5 GB RAM free for `qwen2.5:7b` (the default model); 2 GB for the `llama3.2:3b` fallback
 - ~2–5 GB disk for model weights (downloaded on first start)
 
 ### Linux only — increase `vm.max_map_count`
@@ -143,7 +143,7 @@ All settings live in `.env`. Key variables:
 | `KIBANA_PASSWORD` | Kibana system password | — (required) |
 | `KIBANA_ENCRYPTION_KEY` | Saved-object encryption (32+ chars) | — (required) |
 | `JWT_SECRET` | Session token signing key (32+ chars) | — (required) |
-| `OLLAMA_MODEL` | Default Ollama model | `llama3.2:3b` |
+| `OLLAMA_MODEL` | Default Ollama model | `qwen2.5:7b` |
 | `ANTHROPIC_API_KEY` | Enables Claude as a provider | — (optional) |
 | `OPENAI_API_KEY` | Enables OpenAI as a provider | — (optional) |
 | `ABUSEIPDB_API_KEY` | IP threat intel (free: 1k/day) | — (optional) |

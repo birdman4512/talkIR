@@ -512,6 +512,17 @@ async function handleSubmit(e) {
   contextDetails.appendChild(contextBody);
   contextMsg.appendChild(contextDetails);
 
+  const evidenceDetails = document.createElement('details');
+  evidenceDetails.className = 'think-block context-block';
+  evidenceDetails.hidden = true;
+  const evidenceSummaryLabel = document.createElement('summary');
+  evidenceSummaryLabel.textContent = '// evidence summary';
+  evidenceDetails.appendChild(evidenceSummaryLabel);
+  const evidenceBody = document.createElement('div');
+  evidenceBody.className = 'think-body';
+  evidenceDetails.appendChild(evidenceBody);
+  contextMsg.appendChild(evidenceDetails);
+
   // Full prompt debug block (shown only when debug mode is on)
   const debugDetails = document.createElement('details');
   debugDetails.className = 'think-block debug-block';
@@ -598,6 +609,26 @@ async function handleSubmit(e) {
 
   let hasContent  = false;
   let fullReply   = '';
+  const queryBlocks = [];
+
+  function attachEqlToBlock(qBlock, payload) {
+    if (!qBlock) return;
+    const existing = qBlock.querySelector('.eql-result');
+    if (existing) {
+      existing.previousSibling?.remove();
+      existing.remove();
+    }
+    const language = String(payload.language || '').toUpperCase() || 'EQL';
+    const eqlLabel = document.createElement('div');
+    eqlLabel.className = 'eql-label';
+    eqlLabel.textContent = payload.error ? 'Kibana query conversion error:' : `Kibana ${language} query:`;
+    const eqlPre = document.createElement('pre');
+    eqlPre.className = 'query-code eql-result';
+    eqlPre.textContent = payload.error || payload.query || payload.eql || '';
+    qBlock.appendChild(eqlLabel);
+    qBlock.appendChild(eqlPre);
+    qBlock.open = true;
+  }
 
   try {
     const resp = await fetch('/api/chat', {
@@ -653,6 +684,13 @@ async function handleSubmit(e) {
           if (chunk.status) {
             _thinkingBase = formatStatus(chunk);
             _updateThinking();
+          }
+
+          if (chunk.evidence_summary) {
+            evidenceDetails.hidden = false;
+            contextMsg.hidden = false;
+            evidenceBody.textContent = chunk.evidence_summary;
+            scrollToBottom();
           }
 
           if (chunk.query_progress) {
@@ -765,7 +803,7 @@ async function handleSubmit(e) {
 
               const eqlBtn = document.createElement('button');
               eqlBtn.className = 'btn-query-action';
-              eqlBtn.textContent = '[ eql ]';
+              eqlBtn.textContent = '[ kibana ]';
               eqlBtn.addEventListener('click', async () => {
                 eqlBtn.textContent = '[ converting… ]';
                 eqlBtn.disabled = true;
@@ -773,26 +811,16 @@ async function handleSubmit(e) {
                   const resp = await fetch('/api/eql', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query_body: q, model: getSelectedModel(), provider: getSelectedProvider() }),
+                    body: JSON.stringify({ query_body: q, indices: getSelectedIndices(), model: getSelectedModel(), provider: getSelectedProvider() }),
                   });
                   const data = await resp.json();
                   if (data.error) throw new Error(data.error);
-                  const eqlPre = document.createElement('pre');
-                  eqlPre.className = 'query-code eql-result';
-                  eqlPre.textContent = data.eql;
-                  const eqlLabel = document.createElement('div');
-                  eqlLabel.className = 'eql-label';
-                  eqlLabel.textContent = 'EQL equivalent:';
-                  const existing = qBlock.querySelector('.eql-result');
-                  if (existing) { existing.previousSibling?.remove(); existing.remove(); }
-                  qBlock.appendChild(eqlLabel);
-                  qBlock.appendChild(eqlPre);
-                  qBlock.open = true;
-                  eqlBtn.textContent = '[ eql ]';
+                  attachEqlToBlock(qBlock, data);
+                  eqlBtn.textContent = '[ kibana ]';
                   scrollToBottom();
                 } catch (err) {
-                  eqlBtn.textContent = '[ eql error ]';
-                  setTimeout(() => { eqlBtn.textContent = '[ eql ]'; }, 2000);
+                  eqlBtn.textContent = '[ query error ]';
+                  setTimeout(() => { eqlBtn.textContent = '[ kibana ]'; }, 2000);
                 }
                 eqlBtn.disabled = false;
               });
@@ -801,8 +829,17 @@ async function handleSubmit(e) {
               qActions.appendChild(eqlBtn);
               qBlock.appendChild(qActions);
               contextMsg.appendChild(qBlock);
+              queryBlocks[i] = qBlock;
             });
             contextMsg.hidden = false;
+            scrollToBottom();
+          }
+
+          if (chunk.generated_eql) {
+            contextMsg.hidden = false;
+            chunk.generated_eql.forEach(item => {
+              attachEqlToBlock(queryBlocks[(item.query_index || 1) - 1], item);
+            });
             scrollToBottom();
           }
 
@@ -811,6 +848,23 @@ async function handleSubmit(e) {
             warn.className = 'query-warning';
             warn.textContent = chunk.query_warning;
             contextMsg.appendChild(warn);
+            contextMsg.hidden = false;
+            scrollToBottom();
+          }
+
+          if (chunk.clarification) {
+            const warn = document.createElement('div');
+            warn.className = 'query-warning';
+            warn.textContent = chunk.clarification.message;
+            if (Array.isArray(chunk.clarification.options) && chunk.clarification.options.length) {
+              const opts = document.createElement('div');
+              opts.className = 'query-warning';
+              opts.textContent = `Candidate fields: ${chunk.clarification.options.join(', ')}`;
+              contextMsg.appendChild(warn);
+              contextMsg.appendChild(opts);
+            } else {
+              contextMsg.appendChild(warn);
+            }
             contextMsg.hidden = false;
             scrollToBottom();
           }
@@ -987,6 +1041,9 @@ function formatStatus(chunk) {
   }
   if (chunk.status === 'generating_query') {
     return '[*] generating es query…';
+  }
+  if (chunk.status === 'converting_query') {
+    return '[*] generating kibana eql…';
   }
   if (chunk.status === 'found') {
     return chunk.count > 0

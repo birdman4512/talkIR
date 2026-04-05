@@ -26,5 +26,6 @@ class IndexInfo(BaseModel):
 
 class EqlRequest(BaseModel):
     query_body: dict
+    indices: list[str] = Field(default_factory=list)
     model: Optional[str] = None
     provider: str = "ollama"

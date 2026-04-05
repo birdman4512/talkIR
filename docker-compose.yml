@@ -249,7 +249,7 @@ services:
     environment:
       - OLLAMA_HOST=http://ollama:11434
     entrypoint: ["ollama", "pull"]
-    command: "${OLLAMA_MODEL:-llama3.2:3b}"
+    command: "${OLLAMA_MODEL:-qwen2.5:7b}"
     restart: on-failure
 
   # ── Chat API ────────────────────────────────────────────────────────────────
@@ -275,7 +275,7 @@ services:
       - ES_PASSWORD=${ELASTIC_PASSWORD}
       - ES_CA_CERT_PATH=/certs/ca/ca.crt
       - OLLAMA_HOST=http://ollama:11434
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b}
       - JWT_SECRET=${JWT_SECRET}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}

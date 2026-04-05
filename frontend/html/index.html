@@ -110,7 +110,7 @@
           <div class="bubble">
             ready. drop <code>.json</code> log files into <code>./logs/</code>,
             select indices on the left, then query your events —
-            threat hunting, anomaly analysis, MITRE ATT&amp;CK mapping, you name it.
+            ask things like <code>when have I seen 1.2.3.4 before?</code> and I’ll show the evidence plus a query you can reuse in Kibana.
           </div>
         </div>
       </div>
@@ -120,7 +120,7 @@
         <textarea
           id="queryInput"
           rows="1"
-          placeholder="e.g. are there signs of lateral movement in the last 24 hours?"
+          placeholder="e.g. when have I seen 203.0.113.7 before?"
           required
         ></textarea>
         <button type="button" id="stopBtn" hidden>[ ■ ]</button>
@@ -159,7 +159,7 @@
             </div>
             <div class="guide-row">
               <span class="guide-key">recommended</span>
-              <span class="guide-val"><strong>llama3.2:3b</strong> is the best starting point — fast, fits in 2 GB, handles most queries well. Upgrade to <strong>deepseek-r1:7b</strong> only if you have 5+ GB free and want visible reasoning.</span>
+              <span class="guide-val"><strong>qwen2.5:7b</strong> is the best starting point when you want reliable structured queries and cleaner extraction. Use <strong>llama3.2:3b</strong> as the low-memory fallback if you do not have roughly 5 GB free.</span>
             </div>
           </div>
         </div>
