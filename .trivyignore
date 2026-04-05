@@ -26,9 +26,9 @@ CVE-2025-15467
 CVE-2025-69419
 CVE-2025-69421
 
-# Go stdlib CVEs embedded in /usr/bin/ollama (compiled with Go 1.24.1).
-# These require a newer ollama release built with Go 1.24.13+.
-# v0.18.3 is the latest release as of 2026-03-26 — review on next ollama upgrade.
+# Go stdlib CVEs embedded in /usr/bin/ollama in older upstream builds.
+# Review these ignores on each Ollama image upgrade and remove any entries that
+# no longer reproduce on the pinned image version in this repo.
 
 # crypto/tls — Unexpected session resumption
 CVE-2025-68121
