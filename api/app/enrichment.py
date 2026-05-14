@@ -1,6 +1,7 @@
 """Threat intelligence enrichment for IP addresses found in ES results."""
 import asyncio
 import re
+import time
 
 import httpx
 
@@ -16,6 +17,23 @@ _PRIVATE = re.compile(
 )
 
 MAX_IPS_PER_REQUEST = 15
+
+# VirusTotal free tier allows 4 requests/min — keep a global pacing lock so
+# concurrent enrichments do not all fire at once. AbuseIPDB has a daily quota
+# only (1k/day), so it does not need its own throttle here.
+_VT_MIN_INTERVAL_S = 16.0
+_vt_lock = asyncio.Lock()
+_vt_last_call_monotonic: float = 0.0
+
+
+async def _vt_throttle() -> None:
+    global _vt_last_call_monotonic
+    async with _vt_lock:
+        now = time.monotonic()
+        wait = _VT_MIN_INTERVAL_S - (now - _vt_last_call_monotonic)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _vt_last_call_monotonic = time.monotonic()
 
 
 def extract_ips(events: list[dict]) -> list[str]:
@@ -76,6 +94,7 @@ async def _lookup_virustotal(ip: str) -> dict:
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         for attempt in range(3):
+            await _vt_throttle()
             try:
                 resp = await client.get(url, headers={"x-apikey": settings.virustotal_api_key})
             except Exception as exc:

@@ -159,13 +159,12 @@ def _collect_fields(props: dict, prefix: str, out: list[tuple[str, str]]):
 # Field types where a sample value is worth showing in the prompt
 _SAMPLE_TYPES = {"ip", "keyword", "long", "integer", "text+kw"}
 # Skip values that are UUIDs, hashes, or SIDs — not helpful for the LLM
-import re as _re
-_SKIP_SAMPLE_RE = _re.compile(
+_SKIP_SAMPLE_RE = re.compile(
     r'^[0-9a-f]{32,}$'           # MD5/SHA hashes
     r'|^[0-9a-f-]{36}$'          # UUIDs
     r'|^S-1-\d'                   # Windows SIDs
     r'|^\d{10,}$',                # epoch timestamps, record IDs
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 
@@ -204,11 +203,12 @@ async def _get_field_samples(es, indices: list[str]) -> dict[str, str]:
 async def _get_mapping_fields(
     es, indices: list[str]
 ) -> tuple[str, dict[str, str], dict[str, str]]:
-    """Return (prompt_string, field_type_dict) from ES index mappings.
+    """Return (prompt_string, field_type_dict, samples) from ES index mappings.
 
     prompt_string — "FieldName (type), …" for the query-gen prompt (≤100 fields,
                     security-relevant fields prioritised)
     field_type_dict — {field_name: type_hint} for runtime query sanitisation (all fields)
+    samples — {field_name: example_value} pulled from a small document sample
     """
     # Keywords that signal security-relevant fields — prioritised in the prompt
     _PRIORITY_KEYWORDS = (
@@ -231,7 +231,7 @@ async def _get_mapping_fields(
                 seen.add(name)
                 unique.append((name, hint))
         if not unique:
-            return "(unavailable)", {}
+            return "(unavailable)", {}, {}
         field_types = dict(unique)
         # Sort: priority fields first (by lowest keyword match position), then alphabetical
         def _priority(item: tuple[str, str]) -> tuple[int, str]:
@@ -428,8 +428,20 @@ def _apply_field_rewrites(obj, rewrites: dict[str, str]) -> None:
 
 
 _THINKING_MODEL_PATTERNS = ("deepseek", "r1", "qwq", "thinking")
-_HASH_RE = re.compile(r"\b[a-fA-F0-9]{32,64}\b")
+# Match only canonical hash lengths: 32 (MD5), 40 (SHA1), 64 (SHA256).
+# The earlier 32–64 range matched too many false positives (e.g. UUIDs minus
+# dashes, random hex blobs in messages).
+_HASH_RE = re.compile(r"\b(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\b")
 _DOMAIN_RE = re.compile(r"\b(?=.{4,253}\b)(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,63}\b")
+
+# Field-name fragments that indicate a singular bare-hash value (exact match works).
+_SINGULAR_HASH_NAME_HINTS = (
+    "md5", "sha1", "sha256", "sha512", "sha384",
+    "imphash", "ssdeep", "tlsh", "authentihash",
+)
+# Field-name suffixes/values that indicate a concatenated multi-hash string
+# (Sysmon's "Hashes" field stores "MD5=...;SHA256=...;IMPHASH=...").
+_MULTI_HASH_NAME_HINTS = ("hashes",)
 
 
 def _supports_thinking(model: str) -> bool:
@@ -491,13 +503,26 @@ def _indicator_exact_field(field_name: str, field_type: str) -> str | None:
     return None
 
 
+def _is_multi_hash_field(field_name: str) -> bool:
+    name = field_name.lower()
+    return any(name == hint or name.endswith("." + hint) or name.endswith("_" + hint)
+               for hint in _MULTI_HASH_NAME_HINTS)
+
+
 def _build_indicator_should_clause(field_name: str, field_type: str, indicator_type: str, value: str) -> dict | None:
+    # Sysmon-style multi-hash fields hold "MD5=...;SHA256=..." in one string —
+    # exact term will never match. Use a substring wildcard.
+    if indicator_type == "hash" and _is_multi_hash_field(field_name):
+        return {"wildcard": {field_name: {"value": f"*{value}*", "case_insensitive": True}}}
     exact_field = _indicator_exact_field(field_name, field_type)
     if exact_field:
         if indicator_type == "domain" and field_name == "url.original":
             return {"wildcard": {field_name: {"value": f"*{value}*", "case_insensitive": True}}}
         return {"term": {exact_field: value}}
     if indicator_type == "domain" and field_type in {"text", "wildcard"}:
+        return {"wildcard": {field_name: {"value": f"*{value}*", "case_insensitive": True}}}
+    # Hash hits against text/wildcard fields — substring wildcard
+    if indicator_type == "hash" and field_type in {"text", "wildcard"}:
         return {"wildcard": {field_name: {"value": f"*{value}*", "case_insensitive": True}}}
     return None
 
@@ -510,7 +535,11 @@ def _candidate_indicator_fields(field_types: dict[str, str], indicator_type: str
             if field_type == "ip" or name.endswith(".ip") or "ipaddress" in name or name.endswith("ip"):
                 candidates.append((field_name, field_type))
         elif indicator_type == "hash":
-            if "hash" in name and field_type in {"keyword", "text+kw", "wildcard"}:
+            name_matches = (
+                "hash" in name
+                or any(hint in name for hint in _SINGULAR_HASH_NAME_HINTS)
+            )
+            if name_matches and field_type in {"keyword", "text+kw", "text", "wildcard"}:
                 candidates.append((field_name, field_type))
         elif indicator_type == "domain":
             if (
@@ -917,12 +946,100 @@ def _looks_like_counts_question(query: str) -> bool:
     )
 
 
+# Maps a plain-English entity phrase to a role from _ROLE_RULES.
+# Compound terms must be checked before single tokens (longest match wins).
+_ENTITY_TO_ROLE: dict[str, str] = {
+    # Two-word phrases first
+    "source ip": "source_ip", "source ips": "source_ip",
+    "src ip": "source_ip", "src ips": "source_ip",
+    "client ip": "source_ip", "remote ip": "source_ip",
+    "destination ip": "destination_ip", "destination ips": "destination_ip",
+    "dest ip": "destination_ip", "dest ips": "destination_ip",
+    "dst ip": "destination_ip", "target ip": "destination_ip",
+    "event id": "event_code", "event ids": "event_code",
+    "event code": "event_code", "event codes": "event_code",
+    # Single tokens
+    "sourceip": "source_ip", "srcip": "source_ip",
+    "destip": "destination_ip", "destinationip": "destination_ip", "dstip": "destination_ip",
+    "eventid": "event_code",
+    "user": "user", "users": "user",
+    "username": "user", "usernames": "user",
+    "account": "user", "accounts": "user",
+    "ip": "ip", "ips": "ip",
+    "address": "ip", "addresses": "ip",
+    "host": "host", "hosts": "host",
+    "computer": "host", "computers": "host",
+    "hostname": "host", "hostnames": "host",
+    "machine": "host", "machines": "host",
+    "file": "file_path", "files": "file_path",
+    "filename": "file_path", "filenames": "file_path",
+    "path": "file_path", "paths": "file_path",
+    "url": "url", "urls": "url",
+    "website": "url", "websites": "url",
+    "site": "url", "sites": "url",
+    "process": "action", "processes": "action",
+}
+
+# Stop-words that end a captured entity phrase (e.g. "source IPs in the last 24h")
+_PIVOT_TAIL_STOP = r"(?:\s+(?:in|on|from|during|between|for|where|when|over)\b|[\.\?!,;]|$)"
+
+# Patterns capturing a two-entity pivot phrase, e.g.
+#   "table of usernames to source IPs"
+#   "users by source ip"
+#   "breakdown of source ip per host"
+_PIVOT_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(
+        r"\b(?:table|breakdown|matrix|map(?:ping)?|pivot|summary)\s+of\s+"
+        r"([\w\s]+?)\s+(?:to|by|vs|versus|and|with|grouped\s+by|per|against)\s+"
+        r"(.+?)" + _PIVOT_TAIL_STOP,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b([\w\s]+?)\s+(?:by|per|grouped\s+by|vs|versus)\s+(.+?)" + _PIVOT_TAIL_STOP,
+        re.IGNORECASE,
+    ),
+)
+
+
+def _resolve_entity_phrase(phrase: str) -> str | None:
+    """Map a free-text noun phrase like 'source IPs' to a role name."""
+    if not phrase:
+        return None
+    cleaned = re.sub(r"^\s*(?:the|their|each|every|all|any)\s+", "", phrase.lower()).strip()
+    cleaned = re.sub(r"[^\w\s]+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+    tokens = cleaned.split()
+    # Try the longest trailing window first; query templates put the noun at the end
+    for window in range(min(len(tokens), 3), 0, -1):
+        for start in range(len(tokens) - window, -1, -1):
+            candidate = " ".join(tokens[start:start + window])
+            role = _ENTITY_TO_ROLE.get(candidate)
+            if role:
+                return role
+    return None
+
+
+def _extract_pivot_roles(query: str) -> tuple[str, str] | None:
+    """Return (role_a, role_b) when the query asks for a pivot, else None."""
+    for pattern in _PIVOT_PATTERNS:
+        for match in pattern.finditer(query):
+            role_a = _resolve_entity_phrase(match.group(1))
+            role_b = _resolve_entity_phrase(match.group(2))
+            if role_a and role_b and role_a != role_b:
+                return role_a, role_b
+    return None
+
+
 def _parse_query_intent(query: str) -> dict[str, object]:
     lower = query.lower()
     date_range = _extract_date_range(query)
 
     if _extract_indicator(query):
         return {"name": "indicator_lookup", "date_range": date_range}
+    pivot = _extract_pivot_roles(query)
+    if pivot:
+        return {"name": "pivot_breakdown", "roles": pivot, "date_range": date_range}
     if "ip" in lower and _looks_like_counts_question(query):
         role = "destination_ip" if ("destination" in lower or "dest " in lower or "destip" in lower) else (
             "source_ip" if ("source" in lower or "src " in lower or "sourceip" in lower or "srcip" in lower) else "ip"
@@ -1139,6 +1256,38 @@ def _build_history_between_dates_query(
     }
 
 
+def _build_pivot_fast_path_query(
+    roles: tuple[str, str] | None,
+    schema_profile: dict,
+    max_results: int,
+) -> dict | None:
+    """Build a two-dimensional composite aggregation for "X by Y" pivots."""
+    if not roles:
+        return None
+    schema_profile = _ensure_schema_profile(schema_profile)
+    role_a, role_b = roles
+    field_a = _choose_role_field(schema_profile, role_a)
+    field_b = _choose_role_field(schema_profile, role_b)
+    if not field_a or not field_b or field_a == field_b:
+        return None
+    bucket_size = max(max_results, 50)
+    return {
+        "query": {"match_all": {}},
+        "aggs": {
+            "by_pivot": {
+                "composite": {
+                    "size": min(bucket_size, 1000),
+                    "sources": [
+                        {role_a: {"terms": {"field": field_a}}},
+                        {role_b: {"terms": {"field": field_b}}},
+                    ],
+                }
+            }
+        },
+        "size": 0,
+    }
+
+
 def _build_semantic_fast_path_query(
     query: str,
     indices: list[str],
@@ -1147,7 +1296,12 @@ def _build_semantic_fast_path_query(
 ) -> tuple[dict, str] | None:
     schema_profile = _ensure_schema_profile(schema_profile)
     intent = _parse_query_intent(query)
+    pivot_roles = intent.get("roles") if intent.get("name") == "pivot_breakdown" else None
     planner_map: dict[str, tuple[str, object]] = {
+        "pivot_breakdown": (
+            "Used built-in pivot aggregation for an X-by-Y breakdown request.",
+            lambda q, sp, m: _build_pivot_fast_path_query(pivot_roles, sp, m),
+        ),
         "frequency_breakdown": (
             "Used built-in IP counting for a direct source/destination IP summary request.",
             _build_ip_count_fast_path_query,
@@ -1700,12 +1854,7 @@ async def _smart_search(
     es = get_es_client()
 
     index_str = ", ".join(indices) if indices else "all indices"
-    mapping_info = await _get_mapping_fields(es, indices)
-    if len(mapping_info) == 3:
-        fields_str, field_types, samples = mapping_info
-    else:
-        fields_str, field_types = mapping_info
-        samples = await _get_field_samples(es, indices)
+    fields_str, field_types, samples = await _get_mapping_fields(es, indices)
     schema_profile = _build_schema_profile(field_types, samples)
     fast_path_query = _build_indicator_fast_path_query(query, field_types, max_results)
     if fast_path_query:
@@ -1956,30 +2105,6 @@ async def _keyword_search(indices: list[str], query: str, max_results: int) -> l
 
 
 _MAX_CONTEXT_CHARS = 24_000  # ~6 000 tokens — leave headroom for system prompt + reply
-
-
-def _build_context_block(events: list[dict]) -> str:
-    if not events:
-        return "\n\n[No matching log events found in Elasticsearch for this query.]\n"
-    lines = [f"\n\n--- {len(events)} log event(s) retrieved from Elasticsearch ---\n"]
-    used = len(lines[0])
-    included = 0
-    for i, event in enumerate(events, 1):
-        # Compact JSON; truncate any single value that is excessively long
-        compact = {
-            k: (v[:300] + "…" if isinstance(v, str) and len(v) > 300 else v)
-            for k, v in event.items()
-        }
-        entry = f"\n[Event {i}] {json.dumps(compact, separators=(',', ':'))}\n"
-        if used + len(entry) > _MAX_CONTEXT_CHARS:
-            lines.append(f"\n[…{len(events) - included} more event(s) omitted — reduce result count or narrow your query]\n")
-            break
-        lines.append(entry)
-        used += len(entry)
-        included += 1
-    return "".join(lines)
-
-
 _MAX_EVIDENCE_EXAMPLES = 5
 
 
@@ -2210,12 +2335,12 @@ def _build_context_block(events: list[dict], user_query: str = "") -> str:
     included = 0
     for i, event in enumerate(ordered, 1):
         compact = {
-            k: (v[:300] + "â€¦" if isinstance(v, str) and len(v) > 300 else v)
+            k: (v[:300] + "..." if isinstance(v, str) and len(v) > 300 else v)
             for k, v in event.items()
         }
         entry = f"\n[Event {i}] {json.dumps(compact, separators=(',', ':'))}\n"
         if used + len(entry) > _MAX_CONTEXT_CHARS:
-            lines.append(f"\n[â€¦{len(ordered) - included} more event(s) omitted â€” reduce result count or narrow your query]\n")
+            lines.append(f"\n[...{len(ordered) - included} more event(s) omitted -- reduce result count or narrow your query]\n")
             break
         lines.append(entry)
         used += len(entry)
@@ -2866,17 +2991,18 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
                 yield f"data: {json.dumps({'enrich_status': 'no threat intel API keys configured — add ABUSEIPDB_API_KEY or VIRUSTOTAL_API_KEY to .env'})}\n\n"
             else:
                 yield f"data: {json.dumps({'enrich_status': f'looking up {len(ips)} IP(s)…'})}\n\n"
+                # Fan the IPs out concurrently — VT throttling lives inside the
+                # VT client now, so AbuseIPDB lookups are not blocked by it.
                 enrichments: list[dict] = []
-                for idx, ip in enumerate(ips):
-                    # VirusTotal free tier: 4 req/min — space out calls after the first
-                    if idx > 0 and settings.virustotal_api_key:
-                        await asyncio.sleep(16)
+                tasks = {asyncio.create_task(enrich_ip(ip)): ip for ip in ips}
+                for coro in asyncio.as_completed(tasks):
                     try:
-                        result = await enrich_ip(ip)
+                        result = await coro
                         enrichments.append(result)
                         yield f"data: {json.dumps({'enrichment': result})}\n\n"
                     except Exception as exc:
-                        yield f"data: {json.dumps({'enrichment': {'ip': ip, 'error': str(exc)}})}\n\n"
+                        # asyncio.as_completed loses the originating task — best-effort IP
+                        yield f"data: {json.dumps({'enrichment': {'ip': '?', 'error': str(exc)}})}\n\n"
                 enrichment_context = build_enrichment_context(enrichments)
                 yield f"data: {json.dumps({'enrich_status': f'enriched {len(enrichments)} IP(s)'})}\n\n"
 

@@ -184,6 +184,7 @@ async def test_smart_search_rescues_bad_indicator_query_with_fast_path():
                 "@timestamp": "date",
                 "process.name": "keyword",
             },
+            {},
         )
 
     async def fake_run_query(es, target, body, max_results):
@@ -229,6 +230,7 @@ async def test_smart_search_uses_semantic_failed_login_planner():
                 "event.code": "keyword",
                 "source.ip": "ip",
             },
+            {},
         )
 
     async def fake_run_query(es, target, body, max_results):
