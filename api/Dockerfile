@@ -8,6 +8,13 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # ── Stage 2: runtime ───────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
+# Upgrade Debian packages to pick up patched libssl3t64, openssl
+# (Trivy CRITICAL/HIGH findings).
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Non-root user
 RUN useradd --no-create-home --shell /bin/false appuser
 

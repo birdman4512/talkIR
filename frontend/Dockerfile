@@ -1,4 +1,4 @@
-FROM nginx:1.27-alpine
+FROM nginx:1.30-alpine
 
 # Upgrade Alpine packages to pick up patched libexpat, libpng, libxml2
 # (Trivy CRITICAL/HIGH findings). hadolint ignore=DL3018

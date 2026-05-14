@@ -1,55 +1,49 @@
-# CVEs in fluent/fluent-bit:3.2 base image packages.
-# This image has no shell (/bin/sh absent), so apt-get cannot be run to upgrade
-# packages. These are acknowledged base-image findings outside our control.
-# Review when upgrading fluent-bit to a newer major version.
+# CVEs in upstream base images that cannot be patched at build time.
+# Review every base-image bump and remove entries that no longer reproduce.
 
-# libc6
-CVE-2025-4802
+# ── fluent-bit (fluent/fluent-bit:5.0) ───────────────────────────────────────
+# The fluent-bit image ships no shell (/bin/sh absent), so apt-get cannot
+# upgrade packages in our Dockerfile. Fix has to come from upstream rebuild.
 
-# libgnutls30
-CVE-2025-32988
-CVE-2025-32990
+# libnghttp2-14 — Denial of Service via malformed HTTP/2 frames
+CVE-2026-27135
 
-# liblzma5
-CVE-2025-31115
+# ── ollama (ollama/ollama:0.23.4) ────────────────────────────────────────────
+# CVEs embedded in the upstream /usr/bin/ollama Go binary. We cannot rebuild
+# it, so these clear only when ollama publishes a new image with newer Go.
 
-# libpq5
-CVE-2025-12818
-CVE-2025-8714
-CVE-2025-8715
-CVE-2026-2004
-CVE-2026-2005
-CVE-2026-2006
+# github.com/buger/jsonparser — DoS via malformed JSON input
+CVE-2026-32285
 
-# libssl3
-CVE-2025-15467
-CVE-2025-69419
-CVE-2025-69421
-
-# Go stdlib CVEs embedded in /usr/bin/ollama in older upstream builds.
-# Review these ignores on each Ollama image upgrade and remove any entries that
-# no longer reproduce on the pinned image version in this repo.
-
-# crypto/tls — Unexpected session resumption
-CVE-2025-68121
-
-# crypto/x509 — ExtKeyUsageAny disables policy validation
-CVE-2025-22874
-
-# database/sql — Postgres scan race condition
-CVE-2025-47907
-
-# archive/tar — Unbounded allocation parsing GNU sparse map
-CVE-2025-58183
-
-# net/url — Memory exhaustion in query parameter parsing
-CVE-2025-61726
-
-# archive/zip — Excessive CPU consumption building archive index
-CVE-2025-61728
-
-# crypto/x509 — DoS via excessive resource consumption
-CVE-2025-61729
+# crypto/x509 — Incorrect enforcement of email constraints
+CVE-2026-27137
 
 # net/url — Incorrect parsing of IPv6 host literals
 CVE-2026-25679
+
+# crypto/x509, crypto/tls — DoS in certificate chain building
+CVE-2026-32280
+
+# crypto/x509 — DoS via inefficient certificate chain validation
+CVE-2026-32281
+
+# crypto/tls — DoS via multiple TLS 1.3 key updates
+CVE-2026-32283
+
+# crypto/x509 — Certificate validation bypass via incorrect DNS constraint
+CVE-2026-33810
+
+# net — LookupCNAME excessive resource consumption with long CNAME chains
+CVE-2026-33811
+
+# net/http2 — Infinite loop in HTTP/2 SETTINGS frame processing
+CVE-2026-33814
+
+# net/mail — DoS in ParseAddress / ParseAddressList
+CVE-2026-39820
+
+# net — Panic in Dial / LookupPort on Windows NUL byte (n/a on Linux runtime)
+CVE-2026-39836
+
+# net/mail — DoS via consumePhrase parsing
+CVE-2026-42499

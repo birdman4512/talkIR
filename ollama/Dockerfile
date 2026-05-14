@@ -1,4 +1,4 @@
-FROM ollama/ollama:0.13.5
+FROM ollama/ollama:0.23.4
 
 COPY pull-model.sh /pull-model.sh
 RUN chmod +x /pull-model.sh

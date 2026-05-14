@@ -1,4 +1,4 @@
-FROM fluent/fluent-bit:3.2
+FROM fluent/fluent-bit:5.0
 
 # Copy pipeline configuration
 COPY fluent-bit.conf /fluent-bit/etc/fluent-bit.conf
